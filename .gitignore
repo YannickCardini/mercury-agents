@@ -1,0 +1,24 @@
+# Environnement virtuel
+torch_env/
+venv/
+.venv/
+
+# Cache Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Fichiers sensibles
+.env
+bot_id.txt
+
+# Snapshots d'entraînement (non nécessaires en prod)
+models/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
