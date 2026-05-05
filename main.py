@@ -50,12 +50,7 @@ THINK_MAX = float(os.environ.get("MERCURY_THINK_MAX", "8.5"))
 
 # Identités des bots. Les comptes correspondants existent déjà en base ;
 # le nom est récupéré depuis la réponse de /api/auth/bot.
-BOT_IDENTITIES: list[dict] = [
-    {"botId": "1"},
-    {"botId": "2"},
-    {"botId": "3"},
-    {"botId": "4"},
-]
+BOT_IDENTITIES: list[dict] = [{"botId": str(i)} for i in range(1, 28)]
 
 
 # ── Modèle ────────────────────────────────────────────────────────────────────
@@ -107,10 +102,8 @@ class InferenceBot:
         )
         r.raise_for_status()
         data = r.json()
-        print(f"[auth] réponse API pour bot {self.bot_id}: {data}")
         self.name   = data.get("name", self.bot_id)
         self.picture = data.get("picture", "")
-        print(f"[auth] name={self.name}, picture={self.picture}")
 
     def _resolve_color(self, gs: dict) -> bool:
         for p in gs["players"]:
@@ -202,10 +195,10 @@ def _cleanup_active(active: dict) -> None:
 
 
 def _next_free_identity(active: dict) -> dict | None:
-    for ident in BOT_IDENTITIES:
-        if ident["botId"] not in active:
-            return ident
-    return None
+    free = [ident for ident in BOT_IDENTITIES if ident["botId"] not in active]
+    if not free:
+        return None
+    return random.choice(free)
 
 
 async def dispatch_handler(request: web.Request) -> web.Response:
