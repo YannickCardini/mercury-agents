@@ -13,18 +13,20 @@ _ALL_HOME = {p for positions in HOME_POSITIONS.values() for p in positions}
 
 # ── Coefficients du shaping ───────────────────────────────────────────────────
 # Placés en haut pour faciliter le tuning ultérieur.
-OWN_PROGRESS_COEF    = 1.5   # gain/perte de progrès sur mes billes
+OWN_PROGRESS_COEF    = 0.6   # gain/perte de progrès sur mes billes
+                              # (réduit de 1.5 : évite que l'avancement dense domine la victoire)
 OPP_PROGRESS_COEF    = 1.0   # progrès perdu par un adversaire (capture + swap + 4)
 OPP_ARRIVAL_PENALTY  = 0.15  # malus fixe par bille adverse entrant en zone d'arrivée
 OPP_ARRIVAL_SCALE    = 0.10  # malus additionnel par bille déjà arrivée chez l'adversaire
 THREAT_PENALTY       = 0.05  # malus si une bille à moi est à portée d'un adversaire
 THREAT_RANGE         = 6     # distance (en cases) considérée comme menaçante
-# Bonus d'entrée explicite : valeur actualisée approximative d'une bille complétant
-# le tour (≈ 1.0 × OWN_PROGRESS_COEF × γ^50 ≈ 0.9). Sans ce bonus, le signal
-# immédiat pour "enter" (0.075) ne domine pas suffisamment "advance-1" (0.017).
-ENTRY_BONUS          = 0.4
-WIN_REWARD           = 5.0
-LOSS_REWARD          = -2.0
+# Bonus d'entrée explicite : doit largement dominer "advance-1" pour que l'agent
+# apprenne à faire entrer ses billes plutôt qu'à avancer d'une case avec l'As.
+# Avec OWN_PROGRESS_COEF=0.6, le delta d'entrée vaut 0.05×0.6=0.03 — sans ce
+# bonus, "advance-1" (0.017) et "enter" (0.03) sont quasiment équivalents.
+ENTRY_BONUS          = 1.0
+WIN_REWARD           = 10.0  # doit dominer la somme des rewards denses (~4.0 avec coef 0.6)
+LOSS_REWARD          = -4.0  # symétrie renforcée : perdre doit être aussi significatif que gagner
 
 
 def marble_progress(pos: int, color: str) -> float:

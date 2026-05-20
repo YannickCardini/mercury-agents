@@ -15,7 +15,7 @@ from mercury_legal_moves import (
 
 # ── Constantes d'espace ───────────────────────────────────────────────────────
 
-STATE_DIM  = 92   # encodage de l'état du jeu
+STATE_DIM  = 54   # encodage compact de l'état du jeu (sans zéros parasites)
 ACTION_DIM = 501  # nombre d'actions (cartes × cibles ou split-7)
 
 
@@ -25,16 +25,15 @@ def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
     """
     Encode l'état du jeu en vecteur de STATE_DIM dimensions.
 
-    Structure (92 dims) :
-      [0:4]       → positions de mes 4 billes (0–67 ou OOB)
-      [4:20]      → positions des 16 billes adverses (4 couleurs × 4 billes)
-      [20:40]     → positions normalisées (progrès vers l'arrivée) pour mes billes
-      [40:56]     → progrès des 16 billes adverses
-      [56:60]     → billes de chaque couleur arrivées en zone d'arrivée
-      [60:64]     → ordre de tour (OHE sur 4 couleurs)
-      [64:84]     → main du joueur courant (carte 2..A, 1 si en main, 0 sinon)
-      [84]        → canDiscard (float 0/1)
-      [85:92]     → nombre de billes arrivées par couleur adverse (4) + padding
+    Structure (54 dims) :
+      [0:4]   → positions de mes 4 billes (normalisé 0–68)
+      [4:16]  → positions des 12 billes adverses (3 couleurs × 4)
+      [16:20] → progression normalisée de mes 4 billes vers l'arrivée (0→1)
+      [20:32] → progression des 12 billes adverses (3 couleurs × 4)
+      [32:36] → nombre de billes arrivées par couleur (4 couleurs, normalisé /4)
+      [36:40] → tour actuel (one-hot sur 4 couleurs)
+      [40:53] → main : présence de chaque rang (2..A), one-hot 13 dims
+      [53]    → canDiscard (float 0/1)
     """
     feat = torch.zeros(STATE_DIM, dtype=torch.float32)
 
@@ -46,9 +45,9 @@ def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
     # [0:4] Mes billes
     my_marbles = marbles_by_color.get(my_color, [0, 0, 0, 0])
     for i, pos in enumerate(my_marbles):
-        feat[i] = pos / 68.0  # normaliser par nombre max de positions (~68)
+        feat[i] = pos / 68.0
 
-    # [4:20] Billes adverses (4 couleurs × 4)
+    # [4:16] Billes adverses (3 couleurs × 4 = 12)
     idx = 4
     for color in ALL_COLORS:
         if color != my_color:
@@ -57,12 +56,12 @@ def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
                 feat[idx] = pos / 68.0
                 idx += 1
 
-    # [20:40] Progrès normalisé de mes billes
+    # [16:20] Progression normalisée de mes 4 billes
     for i, pos in enumerate(my_marbles):
-        feat[20 + i] = _marble_progress_norm(pos, my_color)
+        feat[16 + i] = _marble_progress_norm(pos, my_color)
 
-    # [40:56] Progrès des billes adverses
-    idx = 40
+    # [20:32] Progression des billes adverses (3 couleurs × 4 = 12)
+    idx = 20
     for color in ALL_COLORS:
         if color != my_color:
             opp_marbles = marbles_by_color.get(color, [0, 0, 0, 0])
@@ -70,45 +69,33 @@ def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
                 feat[idx] = _marble_progress_norm(pos, color)
                 idx += 1
 
-    # [56:60] Billes de chaque couleur en zone d'arrivée
+    # [32:36] Billes arrivées par couleur (4 couleurs)
     for i, color in enumerate(ALL_COLORS):
         arrival = ARRIVAL_POSITIONS[color]
         marbles = marbles_by_color.get(color, [])
         n_arrived = sum(1 for p in marbles if p in arrival)
-        feat[56 + i] = n_arrived / 4.0
+        feat[32 + i] = n_arrived / 4.0
 
-    # [60:64] Ordre de tour (OHE)
+    # [36:40] Tour actuel (one-hot)
     current_turn = game_state.get('currentTurn', my_color)
     turn_idx = ALL_COLORS.index(current_turn)
-    feat[60 + turn_idx] = 1.0
+    feat[36 + turn_idx] = 1.0
 
-    # [64:84] Main du joueur courant (4 copies × 5 cartes)
+    # [40:53] Main du joueur (13 rangs 2..A, one-hot)
     hand = game_state.get('hand', [])
-    # Extraire les rangs (hand peut être une liste de strings ou de dicts)
-    hand_ranks = set()
+    hand_values = set()
     for card in hand:
         if isinstance(card, dict):
-            hand_ranks.add(card.get('rank', ''))
+            hand_values.add(card.get('value', ''))
         else:
-            hand_ranks.add(str(card))
+            hand_values.add(str(card))
 
     card_names = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
     for card_idx, card_name in enumerate(card_names):
-        feat[64 + card_idx] = 1.0 if card_name in hand_ranks else 0.0
-    # Padding pour atteindre 20
+        feat[40 + card_idx] = 1.0 if card_name in hand_values else 0.0
 
-    # [84] canDiscard
-    feat[84] = 1.0 if game_state.get('canDiscard', False) else 0.0
-
-    # [85:89] Billes arrivées par couleur adverse
-    idx = 85
-    for color in ALL_COLORS:
-        if color != my_color:
-            arrival = ARRIVAL_POSITIONS[color]
-            marbles = marbles_by_color.get(color, [])
-            n_arrived = sum(1 for p in marbles if p in arrival)
-            feat[idx] = n_arrived / 4.0
-            idx += 1
+    # [53] canDiscard
+    feat[53] = 1.0 if game_state.get('canDiscard', False) else 0.0
 
     return feat
 

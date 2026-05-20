@@ -35,14 +35,14 @@ CLIP_EPS     = 0.2
 LR           = 3e-4
 ENTROPY_COEF = 0.01
 VALUE_COEF   = 0.5
-UPDATE_EVERY = 2048  # transitions agrégées avant chaque update PPO (4× plus stable)
+UPDATE_EVERY = 512  
 PPO_EPOCHS   = 4
 BATCH_SIZE   = 64
 
 POOL_SIZE      = 5   # snapshots du passé conservés en mémoire
 SNAPSHOT_EVERY = 10  # sauvegarder un snapshot tous les N updates
 
-COLORS = ['red', 'green', 'blue']
+COLORS = ALL_COLORS  # 4 joueurs : 1 learner (red) + 3 adversaires
 
 
 # ── Rollout par bot (trajectoire d'une partie) ────────────────────────────────
