@@ -1,6 +1,16 @@
 """
 Port fidèle de packages/shared/src/move-validator.ts en Python.
 Calcule le masque de coups légaux sans aller-retour serveur.
+
+IMPORTANT — invincibilité :
+  Un pion est "invincible" entre son entrée (A/K sur sa case start) et son
+  premier mouvement. Le serveur l'envoie dans gameState.players[].marbleInvincible
+  (tableau parallèle à marblePositions). Un pion invincible :
+    - bloque le chemin (avant ET arrière),
+    - ne peut pas être reculé par un 4 (s'il est la source),
+    - ne peut pas être échangé par un J (ni source, ni cible).
+  C'est pourquoi toutes les fonctions reçoivent invincible_by_color
+  (dict color -> liste de positions invincibles).
 """
 
 MAIN_PATH = [
@@ -45,6 +55,9 @@ _ALL_ARRIVAL   = {p for positions in ARRIVAL_POSITIONS.values() for p in positio
 _ALL_HOME      = {p for positions in HOME_POSITIONS.values()    for p in positions}
 _ALL_STARTS    = set(START_POSITIONS.values())
 
+# Sentinelle pour les arguments invincible_by_color optionnels.
+_EMPTY_INV = {c: [] for c in ALL_COLORS}
+
 
 # ── Helpers de navigation ────────────────────────────────────────────────────
 
@@ -66,15 +79,22 @@ def _backward(from_pos: int, steps: int) -> int | None:
     return MAIN_PATH[(idx - steps) % _MAIN_PATH_LEN]
 
 
-def _start_owner(pos: int) -> str | None:
-    for color, start in START_POSITIONS.items():
-        if start == pos:
+def _color_at_position(pos: int, marbles_by_color: dict) -> str | None:
+    """Port de colorAtPosition() : première couleur dont un pion occupe pos."""
+    for color in marbles_by_color:
+        if pos in marbles_by_color[color]:
             return color
     return None
 
 
+def _is_invincible(pos: int, color: str, invincible_by_color: dict) -> bool:
+    """Port de isInvincible() : pos est-elle dans la liste invincible de color."""
+    return pos in invincible_by_color.get(color, [])
+
+
 def _start_btw(from_pos: int, to_pos: int, color: str) -> bool:
-    """True si la case START du joueur se trouve sur le chemin de from_pos → to_pos."""
+    """True si la case START du joueur se trouve sur le chemin de from_pos → to_pos.
+    Port de startPositionBtwFromAndTo()."""
     start = START_POSITIONS[color]
     if start == from_pos:
         return False
@@ -89,25 +109,33 @@ def _start_btw(from_pos: int, to_pos: int, color: str) -> bool:
 
 
 def _path_is_clear(from_pos: int, steps: int, color: str,
-                   all_marbles: list[int], marbles_by_color: dict) -> bool:
-    """Vérifie que le chemin ne passe pas par une case invincible."""
-    from_idx  = _MAIN_PATH_IDX[from_pos]
+                   all_marbles: list[int], marbles_by_color: dict,
+                   invincible_by_color: dict) -> bool:
+    """Port de pathIsClear().
+    Le chemin est bloqué :
+      - par sa PROPRE case de départ (la promotion est gérée en amont),
+      - par tout pion INVINCIBLE rencontré (et seulement invincible).
+    Un pion adverse non-invincible, même posé sur sa case start, NE bloque PAS.
+    """
+    from_idx = _MAIN_PATH_IDX.get(from_pos)
+    if from_idx is None:
+        return False
     own_start = START_POSITIONS[color]
     for i in range(1, steps + 1):
-        pos   = MAIN_PATH[(from_idx + i) % _MAIN_PATH_LEN]
+        pos = MAIN_PATH[(from_idx + i) % _MAIN_PATH_LEN]
         if pos == own_start:
             return False
-        owner = _start_owner(pos)
-        if owner and owner != color and pos in marbles_by_color.get(owner, []):
-            return False
+        if pos in all_marbles:
+            owner = _color_at_position(pos, marbles_by_color)
+            if owner is not None and _is_invincible(pos, owner, invincible_by_color):
+                return False
     return True
 
 
 def _arrival_case(color: str, all_marbles: list[int],
                   from_pos: int, steps: int) -> int | None:
-    """
+    """Port de getArrivelCaseIfCanPromote().
     Retourne la case d'arrivée cible ou None si le nombre de pas ne correspond pas.
-    Logique identique à getArrivelCaseIfCanPromote() du TS.
     """
     available = [p for p in ARRIVAL_POSITIONS[color] if p not in all_marbles]
     if not available:
@@ -121,11 +149,13 @@ def _arrival_case(color: str, all_marbles: list[int],
     return available[-1] if required == steps else None
 
 
-# ── Validation d'un coup ──────────────────────────────────────────────────────
+# ── Construction d'un coup (avant / arrière) ─────────────────────────────────
 
 def _build_forward(card_value: str, from_pos: int, steps: int,
                    own_marbles: list[int], all_marbles: list[int],
-                   color: str, marbles_by_color: dict) -> dict | None:
+                   color: str, marbles_by_color: dict,
+                   invincible_by_color: dict) -> dict | None:
+    """Port de buildMoveAction()."""
     to = _forward(from_pos, steps)
     if to is None:
         return None
@@ -135,19 +165,50 @@ def _build_forward(card_value: str, from_pos: int, steps: int,
             return {'type': 'promote', 'from': from_pos, 'to': arrival}
     if to in own_marbles:
         return None
-    if not _path_is_clear(from_pos, steps, color, all_marbles, marbles_by_color):
+    if not _path_is_clear(from_pos, steps, color, all_marbles,
+                          marbles_by_color, invincible_by_color):
         return None
     action_type = 'capture' if to in all_marbles else 'move'
     return {'type': action_type, 'from': from_pos, 'to': to}
 
 
+def _build_backward(card_value: str, from_pos: int, steps: int,
+                    own_marbles: list[int], all_marbles: list[int],
+                    color: str, marbles_by_color: dict,
+                    invincible_by_color: dict) -> dict | None:
+    """Port de buildBackwardMoveAction().
+    Le recul est bloqué si la destination est occupée par un pion à soi, ou si
+    une case intermédiaire/destination contient un pion INVINCIBLE.
+    """
+    to = _backward(from_pos, steps)
+    if to is None:
+        return None
+    if to in own_marbles:
+        return None
+    for i in range(1, steps + 1):
+        pos = _backward(from_pos, i)
+        if pos is None:
+            return None
+        owner = _color_at_position(pos, marbles_by_color)
+        if owner is not None and _is_invincible(pos, owner, invincible_by_color):
+            return None
+    action_type = 'capture' if to in all_marbles else 'move'
+    return {'type': action_type, 'from': from_pos, 'to': to}
+
+
+# ── Validation d'un coup ──────────────────────────────────────────────────────
+
 def get_legal_action(card_value: str, marble_pos: int,
                      own_marbles: list[int], all_marbles: list[int],
-                     color: str, marbles_by_color: dict) -> dict | None:
-    """
+                     color: str, marbles_by_color: dict,
+                     invincible_by_color: dict | None = None) -> dict | None:
+    """Port de getLegalAction().
     Retourne {'type', 'from', 'to'} ou None si le coup est illégal.
-    Même logique que getLegalAction() dans move-validator.ts.
+    (Le J est géré dans get_legal_mask car la cible du swap est apprise.)
     """
+    if invincible_by_color is None:
+        invincible_by_color = _EMPTY_INV
+
     home  = HOME_POSITIONS[color]
     start = START_POSITIONS[color]
 
@@ -166,11 +227,11 @@ def get_legal_action(card_value: str, marble_pos: int,
                 return None
             return {'type': 'enter', 'from': marble_pos, 'to': start}
         if is_on_main_path(marble_pos):
-            return _build_forward('A', marble_pos, 1,
-                                  own_marbles, all_marbles, color, marbles_by_color)
+            return _build_forward('A', marble_pos, 1, own_marbles, all_marbles,
+                                  color, marbles_by_color, invincible_by_color)
         return None
 
-    # ── J : g\u00e9r\u00e9 par get_legal_mask (choix de cible appris) ────────────────
+    # ── J : géré par get_legal_mask (cible apprise) ─────────────────────────
     if card_value == 'J':
         return None
 
@@ -178,30 +239,23 @@ def get_legal_action(card_value: str, marble_pos: int,
     if card_value == '4':
         if not is_on_main_path(marble_pos):
             return None
-        if marble_pos == start:
+        # Source invincible (fraîchement entrée, jamais bougé) → ne peut reculer.
+        # NB : un pion non-invincible PEUT reculer même posé sur sa propre start.
+        if _is_invincible(marble_pos, color, invincible_by_color):
             return None
-        to = _backward(marble_pos, 4)
-        if to is None or to in own_marbles:
-            return None
-        from_idx = _MAIN_PATH_IDX[marble_pos]
-        for i in range(1, 5):
-            pos   = MAIN_PATH[(from_idx - i) % _MAIN_PATH_LEN]
-            owner = _start_owner(pos)
-            if owner and pos in marbles_by_color.get(owner, []):
-                return None
-        action_type = 'capture' if to in all_marbles else 'move'
-        return {'type': action_type, 'from': marble_pos, 'to': to}
+        return _build_backward('4', marble_pos, 4, own_marbles, all_marbles,
+                               color, marbles_by_color, invincible_by_color)
 
     # ── 2,3,5,6,7,8,9,10,Q : avancer de N ───────────────────────────────────
     dist = CARD_MOVE_DISTANCE.get(card_value)
     if dist is not None and is_on_main_path(marble_pos):
-        return _build_forward(card_value, marble_pos, dist,
-                              own_marbles, all_marbles, color, marbles_by_color)
+        return _build_forward(card_value, marble_pos, dist, own_marbles, all_marbles,
+                              color, marbles_by_color, invincible_by_color)
     return None
 
 
-# ── Espace d'actions \u00e9tendu ───────────────────────────────────────────────────
-# Layout : 5 slots de carte \u00d7 100 sous-actions + 1 discard = 501
+# ── Espace d'actions étendu ───────────────────────────────────────────────────
+# Layout : 5 slots de carte × 100 sous-actions + 1 discard = 501
 #
 # Sous-index (0..99) selon la valeur de la carte du slot :
 #   '7' :
@@ -232,27 +286,45 @@ def _opponent_marble_slots(my_color: str, marbles_by_color: dict) -> list[int]:
     return slots
 
 
-def _is_swappable(pos: int) -> bool:
+def _is_swappable(pos: int, marbles_by_color: dict, invincible_by_color: dict) -> bool:
+    """Port du filtre swappableTargets de getLegalAction (cas J).
+    Une cible est échangeable si elle est sur le main path, n'est PAS invincible,
+    et n'est ni sur une case d'arrivée ni sur une case home.
+    NB : contrairement à la source, une cible PEUT être sur une case start
+    (le serveur ne filtre pas les starts pour la cible du J).
+    """
     if pos < 0 or pos not in _MAIN_PATH_IDX:
         return False
-    return pos not in _ALL_STARTS and pos not in _ALL_ARRIVAL and pos not in _ALL_HOME
+    if pos in _ALL_ARRIVAL or pos in _ALL_HOME:
+        return False
+    owner = _color_at_position(pos, marbles_by_color)
+    if owner is not None and _is_invincible(pos, owner, invincible_by_color):
+        return False
+    return True
 
 
 def _build_7_split(marble_a_pos: int, steps1: int, marble_b_pos: int,
                    own_marbles: list[int], all_marbles: list[int],
-                   color: str, marbles_by_color: dict) -> dict | None:
-    """Port de getLegalSplit7Action : pion A avance steps1, pion B avance 7-steps1."""
+                   color: str, marbles_by_color: dict,
+                   invincible_by_color: dict) -> dict | None:
+    """Port de getLegalSplit7Action : pion A avance steps1, pion B avance 7-steps1.
+    Le contexte du second demi-coup tient compte du déplacement du premier pion
+    (et le premier pion n'est plus invincible après avoir bougé).
+    """
+    if not (1 <= steps1 <= 6):
+        return None
     if marble_a_pos == marble_b_pos:
         return None
     if marble_a_pos not in _MAIN_PATH_IDX or marble_b_pos not in _MAIN_PATH_IDX:
         return None
 
-    action1 = _build_forward('7', marble_a_pos, steps1,
-                             own_marbles, all_marbles, color, marbles_by_color)
+    action1 = _build_forward('7', marble_a_pos, steps1, own_marbles, all_marbles,
+                             color, marbles_by_color, invincible_by_color)
     if action1 is None:
         return None
-    # Le protocole serveur (game.ts) re-d\u00e9rive steps1 via MAIN_PATH.indexOf(to) :
-    # il rejette si to n'est pas sur le main path (donc si action1 est un promote).
+    # Le serveur (game.ts) re-dérive steps1 via MAIN_PATH.indexOf(action.to) et
+    # rejette si to n'est pas sur le main path → un premier demi-coup de type
+    # promote est refusé. (Le SECOND demi-coup peut, lui, être un promote.)
     if action1['type'] == 'promote':
         return None
 
@@ -263,9 +335,15 @@ def _build_7_split(marble_a_pos: int, steps1: int, marble_b_pos: int,
         c: [to1 if p == marble_a_pos else p for p in positions]
         for c, positions in marbles_by_color.items()
     }
+    # Le premier pion a bougé → il n'est plus invincible (on le retire sans le
+    # remplacer par to1, cf. ctx2 dans getLegalSplit7Action).
+    new_inv = {
+        c: [p for p in positions if p != marble_a_pos]
+        for c, positions in invincible_by_color.items()
+    }
 
-    action2 = _build_forward('7', marble_b_pos, 7 - steps1,
-                             new_own, new_all, color, new_mbc)
+    action2 = _build_forward('7', marble_b_pos, 7 - steps1, new_own, new_all,
+                             color, new_mbc, new_inv)
     if action2 is None:
         return None
 
@@ -283,13 +361,20 @@ def _build_7_split(marble_a_pos: int, steps1: int, marble_b_pos: int,
 
 def get_legal_mask(hand: list, marble_positions: list[int],
                    color: str, marbles_by_color: dict,
+                   invincible_by_color: dict | None = None,
                    can_discard: bool = False
                    ) -> tuple[list[bool], list]:
+    """Retourne (mask, actions) :
+      mask    : liste bool de longueur ACTION_DIM (True = légal)
+      actions : liste de ACTION_DIM entrées (None, 'discard', ou (card, action_dict))
+
+    invincible_by_color : dict color -> [positions invincibles], reconstruit à
+      partir de gameState.players[].marbleInvincible (parallèle à marblePositions).
+      Si None, suppose aucun pion invincible (déconseillé : peut diverger du serveur).
     """
-    Retourne (mask, actions) :
-      mask    : liste bool de longueur ACTION_DIM (True = l\u00e9gal)
-      actions : liste de ACTION_DIM entr\u00e9es (None, 'discard', ou (card, action_dict))
-    """
+    if invincible_by_color is None:
+        invincible_by_color = _EMPTY_INV
+
     all_marbles = [p for positions in marbles_by_color.values() for p in positions]
     mask    = [False] * ACTION_DIM
     actions: list = [None] * ACTION_DIM
@@ -311,15 +396,17 @@ def get_legal_mask(hand: list, marble_positions: list[int],
         if card_value == '7':
             # Pion unique (sub 0..3)
             for m_idx, pos in enumerate(marble_positions):
-                action = get_legal_action(card_value, pos,
-                                          marble_positions, all_marbles,
-                                          color, marbles_by_color)
+                action = get_legal_action(card_value, pos, marble_positions,
+                                          all_marbles, color, marbles_by_color,
+                                          invincible_by_color)
                 if action is not None:
                     i = base + m_idx
                     mask[i]    = True
                     actions[i] = (card, action)
 
-            # Split (sub 4..99)
+            # Split (sub 4..99) — PAS de canonicalisation : un index "miroir"
+            # (m_b, 7-s1, m_a) peut produire une action DIFFÉRENTE (type/to)
+            # à cause du contexte mis à jour entre les deux demi-coups.
             for m_a in range(len(marble_positions)):
                 pos_a = marble_positions[m_a]
                 for s1 in range(1, 7):
@@ -327,45 +414,25 @@ def get_legal_mask(hand: list, marble_positions: list[int],
                         if m_a == m_b:
                             continue
                         pos_b = marble_positions[m_b]
-                        split = _build_7_split(
-                            pos_a, s1, pos_b,
-                            marble_positions, all_marbles,
-                            color, marbles_by_color,
-                        )
+                        split = _build_7_split(pos_a, s1, pos_b, marble_positions,
+                                               all_marbles, color, marbles_by_color,
+                                               invincible_by_color)
                         if split is not None:
                             sub = 4 + m_a * 24 + (s1 - 1) * 4 + m_b
                             i   = base + sub
                             mask[i]    = True
                             actions[i] = (card, split)
 
-            # Dédoublonnage canonique : quand (m_a, s1, m_b) et son miroir
-            # (m_b, 7-s1, m_a) sont tous les deux légaux, ils produisent
-            # exactement le même état final (ordre d'exécution sans effet quand
-            # aucune capture mutuelle n'a lieu). On conserve uniquement la forme
-            # canonique m_a < m_b et on efface le non-canonique m_a > m_b.
-            # Si seulement l'un des deux est légal (interaction : l'un capture
-            # l'autre pendant le premier demi-move), on le conserve tel quel.
-            for m_a in range(1, len(marble_positions)):
-                for s1 in range(1, 7):
-                    for m_b in range(m_a):          # m_b < m_a → non-canonique
-                        non_can_sub = 4 + m_a * 24 + (s1 - 1) * 4 + m_b
-                        non_can_i   = base + non_can_sub
-                        if not mask[non_can_i]:
-                            continue                # déjà illégal, rien à faire
-                        # Index canonique symétrique : (m_b, 7-s1, m_a)
-                        can_sub = 4 + m_b * 24 + (7 - s1 - 1) * 4 + m_a
-                        can_i   = base + can_sub
-                        if mask[can_i]:             # les deux légaux → doublon
-                            mask[non_can_i]    = False
-                            actions[non_can_i] = None
-
         elif card_value == 'J':
-            # (my_marble, target_idx) — choix appris
+            # (my_marble, target_idx) — choix appris.
+            # Source : sur le main path, pas sur sa propre start, pas invincible.
             for m_idx, pos in enumerate(marble_positions):
                 if pos not in _MAIN_PATH_IDX or pos == start:
                     continue
+                if _is_invincible(pos, color, invincible_by_color):
+                    continue
                 for t_idx, target_pos in enumerate(opp_slots):
-                    if not _is_swappable(target_pos):
+                    if not _is_swappable(target_pos, marbles_by_color, invincible_by_color):
                         continue
                     sub = m_idx * 12 + t_idx
                     i   = base + sub
@@ -375,11 +442,11 @@ def get_legal_mask(hand: list, marble_positions: list[int],
                     })
 
         else:
-            # Carte r\u00e9guli\u00e8re (sub 0..3)
+            # Carte régulière (sub 0..3)
             for m_idx, pos in enumerate(marble_positions):
-                action = get_legal_action(card_value, pos,
-                                          marble_positions, all_marbles,
-                                          color, marbles_by_color)
+                action = get_legal_action(card_value, pos, marble_positions,
+                                          all_marbles, color, marbles_by_color,
+                                          invincible_by_color)
                 if action is not None:
                     i = base + m_idx
                     mask[i]    = True
@@ -393,7 +460,8 @@ def get_legal_mask(hand: list, marble_positions: list[int],
 
 
 def build_server_message(action_idx: int, hand: list, marble_positions: list[int],
-                         color: str, marbles_by_color: dict) -> dict:
+                         color: str, marbles_by_color: dict,
+                         invincible_by_color: dict | None = None) -> dict:
     """Convertit un index d'action en message WebSocket pour le serveur."""
     if action_idx == DISCARD_IDX:
         return {
@@ -407,10 +475,12 @@ def build_server_message(action_idx: int, hand: list, marble_positions: list[int
             },
         }
 
-    mask, actions = get_legal_mask(hand, marble_positions, color, marbles_by_color, False)
+    mask, actions = get_legal_mask(hand, marble_positions, color, marbles_by_color,
+                                   invincible_by_color, False)
     entry = actions[action_idx] if 0 <= action_idx < ACTION_DIM else None
     if not mask[action_idx] or entry is None or entry == 'discard':
-        return build_server_message(DISCARD_IDX, hand, marble_positions, color, marbles_by_color)
+        return build_server_message(DISCARD_IDX, hand, marble_positions, color,
+                                    marbles_by_color, invincible_by_color)
 
     card, action = entry
     server_action = {

@@ -239,6 +239,16 @@ def _detect_winner(game_state: dict) -> str | None:
 def _marbles_by_color(game_state: dict) -> dict:
     return {p['color']: p['marblePositions'] for p in game_state['players']}
 
+def _invincible_by_color(game_state: dict) -> dict:
+    """Reconstruit {color: [positions invincibles]} depuis marbleInvincible,
+    tableau parallèle à marblePositions envoyé par le serveur."""
+    out = {}
+    for p in game_state['players']:
+        positions = p['marblePositions']
+        inv_flags = p.get('marbleInvincible') or [False] * len(positions)
+        out[p['color']] = [pos for pos, inv in zip(positions, inv_flags) if inv]
+    return out
+
 
 class RLBot:
     def __init__(self, agent: PPOAgent, bot_id: str, name: str,
@@ -261,9 +271,10 @@ class RLBot:
         return False
 
     def _reset_episode(self):
-        self.color    = None
-        self._pending = None
-        self.rollout  = RolloutBuffer()
+        self.color      = None
+        self._pending   = None
+        self._game_over = False  # garde anti-double-fin (gameState gagnant + gameEnded)
+        self.rollout    = RolloutBuffer()
         # L'adversaire tire un réseau aléatoire (pool ou courant) à chaque partie
         if not self.is_learner:
             self.game_net = self.agent.sample_opponent_net()
@@ -318,84 +329,102 @@ class RLBot:
             "userId":     self.bot_id,
         }))
 
+    def _on_game_end(self, gs: dict | None, winner: str | None) -> bool:
+        """Fin de partie : flush la trajectoire et signale qu'il faut fermer la WS.
+        On NE PEUT PAS re-join sur la même WebSocket : une fois la partie lancée,
+        le MultiWsMessenger du Game capte tous les messages entrants de cette WS
+        (handler permanent), et le handler initial de session (index.ts) est
+        `{ once: true }` — donc un joinMatchmaking renvoyé sur la même socket
+        n'atteint jamais le matchmaking. Il faut fermer puis rouvrir.
+        Retourne True si la fin a été traitée (→ l'appelant doit return)."""
+        if self._game_over:
+            return True  # déjà traité (un gameState gagnant a précédé gameEnded)
+        self._game_over = True
+        self._flush_pending(curr_gs=gs, done=True, winner=winner, next_value=0.0)
+        self._flush_rollout()
+        self.agent.n_games += 1
+        result = "GAGNÉ" if winner == self.color else "perdu"
+        print(f"[{self.name}] {result} (gagnant : {winner})")
+        return True
+
     async def run(self, ws):
+        self._reset_episode()  # nouvelle WS = nouvelle partie : réarme _game_over, rollout, etc.
         await self._join(ws)
         loop = asyncio.get_event_loop()
-        anim_done = json.dumps({"type": "animationDone"})
 
         async for raw in ws:
-            msg = json.loads(raw)
+            try:
+                msg = json.loads(raw)
 
-            # Débloquer le serveur dès qu'une action est animée
-            if msg.get("type") == "actionPlayed":
-                await ws.send(anim_done)
+                # actionPlayed : le serveur fait autorité sur le timing
+                # (animationDone est ignoré côté serveur) → rien à faire.
+                if msg.get("type") == "actionPlayed":
+                    continue
+
+                if msg.get("type") == "gameEnded":
+                    self._on_game_end(gs=None, winner=msg.get("winner"))
+                    return  # ferme la WS → run_bot reconnecte pour la partie suivante
+
+                if msg.get("type") != "gameState":
+                    continue
+
+                gs = msg["gameState"]
+                if not self._resolve_color(gs):
+                    continue  # our join isn't reflected yet
+                winner     = _detect_winner(gs)
+                is_my_turn = gs["currentTurn"] == self.color
+
+                # ── Fin de partie détectée via gameState ────────────────────
+                if winner is not None:
+                    self._on_game_end(gs=gs, winner=winner)
+                    return  # ferme la WS → run_bot reconnecte pour la partie suivante
+
+                # ── Passer si ce n'est pas mon tour ─────────────────────────
+                if not is_my_turn:
+                    continue
+
+                # ── Mon tour : décider, jouer, gérer le pending ─────────────
+                hand         = gs.get("hand", [])
+                can_discard  = gs.get("canDiscard", False)
+                mbc          = _marbles_by_color(gs)
+                my_marbles   = mbc[self.color]
+                inv_by_color = _invincible_by_color(gs)
+
+                mask, _ = get_legal_mask(
+                    hand, my_marbles, self.color, mbc,
+                    invincible_by_color=inv_by_color,
+                    can_discard=can_discard,
+                )
+                if not any(mask):
+                    continue  # ne devrait pas arriver
+
+                state_enc               = encode_state(gs, self.color)
+                action, log_prob, value = await self._select_action(loop, state_enc, mask)
+
+                # Flush de la décision précédente avec le V(s) courant comme next_value
+                self._flush_pending(curr_gs=gs, done=False,
+                                    winner=None, next_value=value)
+
+                msg_out = build_server_message(
+                    action, hand, my_marbles, self.color, mbc,
+                    invincible_by_color=inv_by_color,
+                )
+                await ws.send(json.dumps(msg_out))
+
+                self._pending = {
+                    'gs':   gs,
+                    'enc':  state_enc,
+                    'mask': torch.tensor(mask, dtype=torch.bool),
+                    'act':  action,
+                    'lp':   log_prob,
+                    'val':  value,
+                }
+
+            except Exception as e:
+                # Une erreur isolée (message inattendu, etc.) ne doit PAS fermer
+                # la WS : sinon les 3 autres bots restent bloqués 180s.
+                print(f"[{self.name}] erreur traitement message: {e!r}")
                 continue
-
-            if msg.get("type") == "gameEnded":
-                winner = msg.get("winner")
-                # Flush terminal : dernière transition avec la récompense terminale
-                self._flush_pending(curr_gs=None, done=True,
-                                    winner=winner, next_value=0.0)
-                self._flush_rollout()
-                self.agent.n_games += 1
-                result = "GAGNÉ" if winner == self.color else "perdu"
-                print(f"[{self.name}] {result} (gagnant : {winner})")
-                self._reset_episode()
-                return  # ferme le WS, le while True externe reconnecte
-
-            if msg.get("type") != "gameState":
-                continue
-
-            gs = msg["gameState"]
-            if not self._resolve_color(gs):
-                continue  # our join isn't reflected yet
-            winner     = _detect_winner(gs)
-            is_my_turn = gs["currentTurn"] == self.color
-
-            # ── Fin de partie détectée via gameState ────────────────────────
-            if winner is not None:
-                self._flush_pending(curr_gs=gs, done=True,
-                                    winner=winner, next_value=0.0)
-                self._flush_rollout()
-                self.agent.n_games += 1
-                result = "GAGNÉ" if winner == self.color else "perdu"
-                print(f"[{self.name}] {result} (gagnant : {winner})")
-                self._reset_episode()
-                await self._join(ws)
-                continue
-
-            # ── Passer si ce n'est pas mon tour ─────────────────────────────
-            if not is_my_turn:
-                continue
-
-            # ── Mon tour : décider, jouer, gérer le pending ─────────────────
-            hand        = gs.get("hand", [])
-            can_discard = gs.get("canDiscard", False)
-            mbc         = _marbles_by_color(gs)
-            my_marbles  = mbc[self.color]
-
-            mask, _ = get_legal_mask(hand, my_marbles, self.color, mbc, can_discard)
-            if not any(mask):
-                continue  # ne devrait pas arriver
-
-            state_enc               = encode_state(gs, self.color)
-            action, log_prob, value = await self._select_action(loop, state_enc, mask)
-
-            # Flush de la décision précédente avec le V(s) courant comme next_value
-            self._flush_pending(curr_gs=gs, done=False,
-                                winner=None, next_value=value)
-
-            msg_out = build_server_message(action, hand, my_marbles, self.color, mbc)
-            await ws.send(json.dumps(msg_out))
-
-            self._pending = {
-                'gs':   gs,
-                'enc':  state_enc,
-                'mask': torch.tensor(mask, dtype=torch.bool),
-                'act':  action,
-                'lp':   log_prob,
-                'val':  value,
-            }
 
 
 # ── Boucle d'entraînement ─────────────────────────────────────────────────────

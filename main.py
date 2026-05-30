@@ -176,6 +176,7 @@ class InferenceBot:
 async def run_bot_session(net: MercuryNet, identity: dict) -> None:
     """Cycle complet : auth → WS → 1 partie → close. Robuste aux erreurs."""
     bot = InferenceBot(net, identity)
+    print("connection du bot", bot.bot_id)
     try:
         async with httpx.AsyncClient() as client:
             await bot.authenticate(client)

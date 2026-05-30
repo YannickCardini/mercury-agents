@@ -166,8 +166,8 @@ class MercuryNet(nn.Module):
         probs = F.softmax(logits, dim=-1)
         dist = Categorical(probs)
 
-        # Valeur
-        value = self.value_head(h)
+        # Valeur — squeeze la dim de sortie (…, 1) → (…,) pour matcher returns
+        value = self.value_head(h).squeeze(-1)
 
         if not is_batch:
             value = value.squeeze(0)

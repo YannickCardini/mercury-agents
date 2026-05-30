@@ -25,6 +25,12 @@ THREAT_RANGE         = 6     # distance (en cases) considérée comme menaçante
 # Avec OWN_PROGRESS_COEF=0.6, le delta d'entrée vaut 0.05×0.6=0.03 — sans ce
 # bonus, "advance-1" (0.017) et "enter" (0.03) sont quasiment équivalents.
 ENTRY_BONUS          = 1.0
+# Bonus d'arrivée : faire rentrer une bille en zone d'arrivée est l'une des
+# étapes les plus importantes du jeu (arriver 4 billes = victoire). C'est donc
+# la 2ème plus grosse récompense après la victoire (+10), nettement au-dessus
+# de l'entrée en jeu (+1) et du recul adverse (+1). Déclenché une seule fois,
+# au passage main path → zone d'arrivée (pas par slot).
+ARRIVAL_BONUS        = 3.0
 WIN_REWARD           = 10.0  # doit dominer la somme des rewards denses (~4.0 avec coef 0.6)
 LOSS_REWARD          = -4.0  # symétrie renforcée : perdre doit être aussi significatif que gagner
 
@@ -81,6 +87,7 @@ def compute_reward(prev_gs: dict, curr_gs: dict, my_color: str) -> float:
     Termes :
       - Progrès de mes billes         : delta_progress × OWN_PROGRESS_COEF
       - Entrée d'une bille (home→jeu) : + ENTRY_BONUS  (valeur actualisée de la bille)
+      - Arrivée d'une bille (plateau→zone d'arrivée) : + ARRIVAL_BONUS
       - Progrès perdu par un adversaire (capture / swap / 4 adverse)
                                       : |delta_progress_adverse| × OPP_PROGRESS_COEF
       - Adversaire entrant en arrivée : − OPP_ARRIVAL_PENALTY − n_déjà × OPP_ARRIVAL_SCALE
@@ -90,6 +97,7 @@ def compute_reward(prev_gs: dict, curr_gs: dict, my_color: str) -> float:
 
     prev_mine = _get_marbles(prev_gs, my_color)
     curr_mine = _get_marbles(curr_gs, my_color)
+    my_arrival = ARRIVAL_POSITIONS[my_color]
 
     # ── Progrès de mes billes (positif = avance, négatif = capturé/swap arrière)
     for prev_p, curr_p in zip(prev_mine, curr_mine):
@@ -99,6 +107,10 @@ def compute_reward(prev_gs: dict, curr_gs: dict, my_color: str) -> float:
         # ne domine pas "advance-1" (≈0.017) malgré la valeur stratégique réelle.
         if prev_p in HOME_POSITIONS[my_color] and curr_p not in HOME_POSITIONS[my_color]:
             reward += ENTRY_BONUS
+        # Bonus d'arrivée : la bille passe du plateau à ma zone d'arrivée.
+        # Étape stratégique majeure → 2ème plus grosse récompense après la victoire.
+        if prev_p not in my_arrival and curr_p in my_arrival:
+            reward += ARRIVAL_BONUS
 
     # ── Progrès perdu par les adversaires (capture + swap + card-4 adverse) ──
     # En sémantique semi-MDP (du tour T au tour T+1 du même bot), ce terme

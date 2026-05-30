@@ -114,18 +114,22 @@ Récompenses **denses** calculées à chaque transition (pas seulement en fin de
 
 | Récompense                  | Coefficient | Condition                                                  |
 |-----------------------------|-------------|------------------------------------------------------------|
-| Progression de ses marbles  | `+0.6`      | Marble qui avance sur le plateau (normalisé 0→1)           |
-| Entrée en jeu d'une marble  | `+1.0`      | Marble quittant la maison pour la case départ              |
-| Recul d'une marble adverse  | `+1.0`      | Adversaire capturé, swappé ou reculé par carte 4           |
-| Arrivée d'un adversaire     | `-0.15`     | Adverse entrant en zone d'arrivée (scalé par déjà arrivés) |
-| Menace (proximité)          | `-0.05`     | Marble propre à moins de 6 cases d'un adversaire           |
-| **Victoire**                | `+10.0`     | Terminale                                                  |
-| **Défaite**                 | `-4.0`      | Terminale                                                  |
+| Progression de ses marbles    | `+0.6`      | Marble qui avance sur le plateau (normalisé 0→1)           |
+| Entrée en jeu d'une marble    | `+1.0`      | Marble quittant la maison pour la case départ              |
+| **Arrivée d'une marble**      | `+3.0`      | Marble propre entrant en zone d'arrivée (une fois)         |
+| Recul d'une marble adverse    | `+1.0`      | Adversaire capturé, swappé ou reculé par carte 4           |
+| Arrivée d'un adversaire       | `-0.15`     | Adverse entrant en zone d'arrivée (scalé par déjà arrivés) |
+| Menace (proximité)            | `-0.05`     | Marble propre à moins de 6 cases d'un adversaire           |
+| **Victoire**                  | `+10.0`     | Terminale                                                  |
+| **Défaite**                   | `-4.0`      | Terminale                                                  |
 
-> **Calibration :** le reward de victoire représente ~61% du reward total d'une partie gagnante,
-> ce qui en fait le signal dominant. L'entrée en jeu (`+1.0`) est intentionnellement bien
-> supérieure à l'avancement d'une case (~`+0.007`), pour éviter que l'agent utilise l'As
-> pour avancer plutôt que pour faire entrer une bille.
+> **Calibration :** le reward de victoire (`+10.0`) reste le signal dominant. L'**arrivée d'une
+> bille** (`+3.0`) est la 2ème plus grosse récompense : faire rentrer ses billes en zone d'arrivée
+> est l'une des étapes décisives du jeu (4 billes arrivées = victoire), donc bien au-dessus de
+> l'entrée en jeu et du recul adverse (`+1.0`). Le bonus est déclenché une seule fois, au passage
+> plateau → zone d'arrivée (l'avancement dans les slots reste couvert par le progrès dense).
+> L'entrée en jeu (`+1.0`) est intentionnellement bien supérieure à l'avancement d'une case
+> (~`+0.007`), pour éviter que l'agent utilise l'As pour avancer plutôt que pour faire entrer une bille.
 
 ---
 
