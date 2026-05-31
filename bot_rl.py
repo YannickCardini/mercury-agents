@@ -9,6 +9,7 @@ Lancer :
 
 import asyncio, json, pathlib, random, threading
 import concurrent.futures, functools
+from collections import deque
 import torch
 import torch.nn.functional as F
 import httpx
@@ -39,8 +40,11 @@ UPDATE_EVERY = 512
 PPO_EPOCHS   = 4
 BATCH_SIZE   = 64
 
-POOL_SIZE      = 5   # snapshots du passé conservés en mémoire
-SNAPSHOT_EVERY = 10  # sauvegarder un snapshot tous les N updates
+POOL_SIZE      = 5    # snapshots du passé conservés en mémoire
+SNAPSHOT_EVERY = 10   # sauvegarder un snapshot tous les N updates
+WINRATE_WINDOW = 200  # fenêtre glissante pour la win-rate des bots learner
+LEARNER_PROB   = 0.6  # proba qu'un bot joue le réseau courant (→ learner) par partie
+                      # ⇒ ~2-3 des 4 bots alimentent le gradient ; le reste = pool gelé
 
 COLORS = ALL_COLORS  # 4 joueurs : 1 learner (red) + 3 adversaires
 
@@ -134,6 +138,9 @@ class PPOAgent:
         self.n_games    = 0
         self.pool: list[MercuryNet] = []   # snapshots gelés (pool d'adversaires)
         self._inference_lock = threading.Lock()  # protège net pendant updates
+        # Fenêtre glissante des résultats des bots learner (1 = gagné, 0 = perdu).
+        # Métrique de référence : doit dépasser 0.25 (hasard à 4 joueurs) si l'agent progresse.
+        self.recent_wins = deque(maxlen=WINRATE_WINDOW)
         self._load()
 
     def _load(self):
@@ -161,12 +168,13 @@ class PPOAgent:
             old.unlink(missing_ok=True)
 
     def sample_opponent_net(self) -> MercuryNet:
-        """Tire aléatoirement un réseau du pool (ou le réseau courant si pool vide)."""
+        """Tire aléatoirement un snapshot GELÉ du pool (jamais le réseau courant).
+        Le choix courant-vs-pool est fait en amont dans RLBot._reset_episode ; ici on
+        ne renvoie que des adversaires figés pour que `game_net is agent.net` reste un
+        test fiable du rôle learner. Repli sur le réseau courant si le pool est vide."""
         if not self.pool:
             return self.net
-        # 50 % courant, 50 % pool → le pool se diversifie sans trop décrocher
-        candidates = self.pool + [self.net]
-        return random.choice(candidates)
+        return random.choice(self.pool)
 
     def select_action(self, state: torch.Tensor,
                       mask: list[bool]) -> tuple[int, float, float]:
@@ -192,6 +200,10 @@ class PPOAgent:
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
+        # Métriques accumulées sur tous les mini-batches de l'update (pour le log).
+        sum_p_loss = sum_v_loss = sum_entropy = sum_kl = 0.0
+        n_batches  = 0
+
         with self._inference_lock:  # bloque les inférences pendant les updates
             for _ in range(PPO_EPOCHS):
                 perm = torch.randperm(n)
@@ -215,13 +227,29 @@ class PPOAgent:
                     torch.nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)
                     self.optimizer.step()
 
+                    # KL approx (old - new) : indicateur de l'amplitude du pas de politique.
+                    with torch.no_grad():
+                        approx_kl = (old_lps[idx] - log_probs).mean()
+                    sum_p_loss += p_loss.item()
+                    sum_v_loss += v_loss.item()
+                    sum_entropy += entropy.item()
+                    sum_kl     += approx_kl.item()
+                    n_batches  += 1
+
         self.buffer.clear()
         self.n_updates += 1
         torch.save(self.net.state_dict(), MODEL_PATH)
         if self.n_updates % SNAPSHOT_EVERY == 0:
             self._save_snapshot()
+
+        nb = max(n_batches, 1)
+        win_rate = (sum(self.recent_wins) / len(self.recent_wins)
+                    if self.recent_wins else float('nan'))
         print(f"[PPO] update #{self.n_updates}  parties={self.n_games}  "
-              f"transitions={n}  pool={len(self.pool)}  sauvegardé → {MODEL_PATH}")
+              f"transitions={n}  pool={len(self.pool)}  "
+              f"p_loss={sum_p_loss / nb:+.4f}  v_loss={sum_v_loss / nb:.4f}  "
+              f"ent={sum_entropy / nb:.3f}  kl={sum_kl / nb:+.4f}  "
+              f"win_rate={win_rate:.3f} (n={len(self.recent_wins)})  → {MODEL_PATH}")
 
 
 # ── Bot individuel ────────────────────────────────────────────────────────────
@@ -252,10 +280,9 @@ def _invincible_by_color(game_state: dict) -> dict:
 
 class RLBot:
     def __init__(self, agent: PPOAgent, bot_id: str, name: str,
-                 is_learner: bool = True,
                  executor: concurrent.futures.Executor = None):
         self.agent      = agent
-        self.is_learner = is_learner  # False → adversaire du pool, pas de gradient
+        self.is_learner = True        # (re)décidé par partie dans _reset_episode
         self.color      = None        # assigned by the server
         self.bot_id     = bot_id
         self.name       = name
@@ -275,9 +302,17 @@ class RLBot:
         self._pending   = None
         self._game_over = False  # garde anti-double-fin (gameState gagnant + gameEnded)
         self.rollout    = RolloutBuffer()
-        # L'adversaire tire un réseau aléatoire (pool ou courant) à chaque partie
-        if not self.is_learner:
+        # Rôle tiré PAR PARTIE (self-play avec pool conservé) : chaque bot joue soit
+        # le réseau courant (→ learner, accumule le gradient), soit un snapshot gelé du
+        # pool (→ adversaire figé, diversité / anti-oubli). On ne fige plus le rôle par
+        # couleur : ainsi 2-3 bots learner en moyenne alimentent le buffer chaque partie.
+        if random.random() < LEARNER_PROB or not self.agent.pool:
+            self.game_net = self.agent.net
+        else:
             self.game_net = self.agent.sample_opponent_net()
+        # is_learner ⇔ "joue le réseau courant" : c'est cette condition (et non un rôle
+        # fixe) qui décide si la trajectoire est utilisée pour le gradient.
+        self.is_learner = (self.game_net is self.agent.net)
 
     def _flush_rollout(self):
         """Transfère le rollout vers le buffer d'entraînement (learner uniquement)."""
@@ -343,7 +378,12 @@ class RLBot:
         self._flush_pending(curr_gs=gs, done=True, winner=winner, next_value=0.0)
         self._flush_rollout()
         self.agent.n_games += 1
-        result = "GAGNÉ" if winner == self.color else "perdu"
+        won = (winner == self.color)
+        # Seuls les bots jouant le réseau courant (learner) comptent dans la win-rate :
+        # mesurer les snapshots gelés brouillerait la métrique de progression.
+        if self.is_learner:
+            self.agent.recent_wins.append(1 if won else 0)
+        result = "GAGNÉ" if won else "perdu"
         print(f"[{self.name}] {result} (gagnant : {winner})")
         return True
 
@@ -433,13 +473,11 @@ async def run_training():
     agent = PPOAgent()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
-    # Premier bot = learner (accumule le gradient).
-    # Les autres sont des adversaires qui tirent aléatoirement dans le pool
-    # de snapshots → diversité des opposants, stabilité de l'entraînement.
-    LEARNER_COLOR = COLORS[0]
+    # Plus de rôle fixe par couleur : chaque bot tire son rôle PAR PARTIE dans
+    # _reset_episode (réseau courant → learner, ou snapshot du pool → adversaire figé).
+    # En moyenne ~LEARNER_PROB × 4 bots alimentent le gradient à chaque partie.
 
     async def run_bot(color: str):
-        is_learner = (color == LEARNER_COLOR)
         bot_id     = f"rl-bot-{color}"
         name       = f"RL-{color.capitalize()}"
         async with httpx.AsyncClient() as client:
@@ -447,7 +485,7 @@ async def run_training():
                 f"{API_URL}/api/auth/bot",
                 json={"secret": BOT_SECRET, "botId": bot_id, "name": name},
             )
-        bot = RLBot(agent, bot_id, name, is_learner=is_learner, executor=executor)
+        bot = RLBot(agent, bot_id, name, executor=executor)
         while True:
             try:
                 async with websockets.connect(WS_URL) as ws:

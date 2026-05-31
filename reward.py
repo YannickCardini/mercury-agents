@@ -20,19 +20,32 @@ OPP_ARRIVAL_PENALTY  = 0.15  # malus fixe par bille adverse entrant en zone d'ar
 OPP_ARRIVAL_SCALE    = 0.10  # malus additionnel par bille déjà arrivée chez l'adversaire
 THREAT_PENALTY       = 0.05  # malus si une bille à moi est à portée d'un adversaire
 THREAT_RANGE         = 6     # distance (en cases) considérée comme menaçante
-# Bonus d'entrée explicite : doit largement dominer "advance-1" pour que l'agent
-# apprenne à faire entrer ses billes plutôt qu'à avancer d'une case avec l'As.
-# Avec OWN_PROGRESS_COEF=0.6, le delta d'entrée vaut 0.05×0.6=0.03 — sans ce
-# bonus, "advance-1" (0.017) et "enter" (0.03) sont quasiment équivalents.
+# Bonus d'entrée explicite : faire entrer une bille en jeu est rare et débloquant
+# (sans bille en jeu on passe son tour). On le garde volontairement gros : il doit
+# largement dominer "advance-1" (≈0.017) pour que l'agent utilise l'As/le Roi pour
+# entrer plutôt que pour grappiller une case.
 ENTRY_BONUS          = 1.0
-# Bonus d'arrivée : faire rentrer une bille en zone d'arrivée est l'une des
-# étapes les plus importantes du jeu (arriver 4 billes = victoire). C'est donc
-# la 2ème plus grosse récompense après la victoire (+10), nettement au-dessus
-# de l'entrée en jeu (+1) et du recul adverse (+1). Déclenché une seule fois,
-# au passage main path → zone d'arrivée (pas par slot).
+# Bonus d'arrivée : faire rentrer une bille en zone d'arrivée est l'une des étapes
+# les plus importantes du jeu (4 billes arrivées = victoire). C'est la 2ème plus
+# grosse récompense après la victoire, nettement au-dessus de l'entrée (+1) et du
+# recul adverse (+1). Déclenché une seule fois, au passage main path → zone d'arrivée.
 ARRIVAL_BONUS        = 3.0
-WIN_REWARD           = 10.0  # doit dominer la somme des rewards denses (~4.0 avec coef 0.6)
-LOSS_REWARD          = -4.0  # symétrie renforcée : perdre doit être aussi significatif que gagner
+
+# ── Calibration WIN/LOSS ──────────────────────────────────────────────────────
+# IMPORTANT — la 4ᵉ arrivée DÉCLENCHE la victoire : l'événement "arriver sa dernière
+# bille" est donc payé deux fois (ARRIVAL_BONUS au dernier flush + WIN_REWARD terminal).
+# Pour que l'agent optimise réellement GAGNER (et pas seulement "farmer des arrivées"),
+# WIN doit dominer la somme MAXIMALE des récompenses denses d'une partie gagnante :
+#     4×ENTRY (4.0) + 4×ARRIVAL (12.0) + progrès own max (~2.4 = 4×1.0×0.6)
+#     + captures/reculs adverses (variable, ~+1 à +3)   ≈  +18 à +20
+# On fixe donc WIN = +30 (≈ 1.5× le plafond dense) pour rester strictement dominant.
+# Si en pratique la somme dense observée dépasse +20, monter WIN à +40 plutôt que de
+# rogner ENTRY/ARRIVAL (qui restent des objectifs de jeu légitimes).
+WIN_REWARD           = 30.0
+# Symétrie : sans un LOSS aussi fort, les retours restent biaisés positifs (le dense
+# est presque toujours ≥ 0), le critique apprend une baseline haute et l'avantage
+# discrimine mal gagner/perdre.
+LOSS_REWARD          = -30.0
 
 
 def marble_progress(pos: int, color: str) -> float:

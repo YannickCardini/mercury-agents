@@ -82,6 +82,19 @@ def _marbles_by_color(gs: dict) -> dict:
     return {p["color"]: p["marblePositions"] for p in gs["players"]}
 
 
+def _invincible_by_color(gs: dict) -> dict:
+    """Reconstruit {color: [positions invincibles]} depuis marbleInvincible,
+    tableau parallèle à marblePositions envoyé par le serveur.
+    Indispensable pour que le masque légal d'inférence soit IDENTIQUE à celui
+    de l'entraînement (cf. bot_rl.py)."""
+    out = {}
+    for p in gs["players"]:
+        positions = p["marblePositions"]
+        inv_flags = p.get("marbleInvincible") or [False] * len(positions)
+        out[p["color"]] = [pos for pos, inv in zip(positions, inv_flags) if inv]
+    return out
+
+
 # ── Bot d'inférence ───────────────────────────────────────────────────────────
 
 class InferenceBot:
@@ -157,9 +170,11 @@ class InferenceBot:
 
             hand = gs.get("hand", [])
             mbc  = _marbles_by_color(gs)
+            inv_by_color = _invincible_by_color(gs)
             mask, _ = get_legal_mask(
                 hand, mbc[self.color], self.color, mbc,
-                gs.get("canDiscard", False),
+                invincible_by_color=inv_by_color,
+                can_discard=gs.get("canDiscard", False),
             )
             if not any(mask):
                 continue
@@ -168,6 +183,7 @@ class InferenceBot:
             action    = self._select_action(state_enc, mask)
             msg_out   = build_server_message(
                 action, hand, mbc[self.color], self.color, mbc,
+                invincible_by_color=inv_by_color,
             )
             await asyncio.sleep(random.uniform(THINK_MIN, THINK_MAX))
             await ws.send(json.dumps(msg_out))
