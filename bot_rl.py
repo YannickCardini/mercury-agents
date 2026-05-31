@@ -34,7 +34,9 @@ GAMMA        = 0.99
 GAE_LAMBDA   = 0.95
 CLIP_EPS     = 0.2
 LR           = 3e-4
-ENTROPY_COEF = 0.01
+ENTROPY_COEF = 0.015  # optimum en U inversé : 0.01 figeait l'agent (entropie ~0.10,
+                      # eval~0.70) ; 0.025 sur-explorait (entropie ~0.40, eval baissée à 0.64).
+                      # 0.015 = compromis exploration/exploitation entre les deux extrêmes.
 VALUE_COEF   = 0.5
 UPDATE_EVERY = 512  
 PPO_EPOCHS   = 4
@@ -46,7 +48,54 @@ WINRATE_WINDOW = 200  # fenêtre glissante pour la win-rate des bots learner
 LEARNER_PROB   = 0.6  # proba qu'un bot joue le réseau courant (→ learner) par partie
                       # ⇒ ~2-3 des 4 bots alimentent le gradient ; le reste = pool gelé
 
+# ── Évaluation vs bots aléatoires ───────────────────────────────────────────────
+# Le win_rate vs pool tend mécaniquement vers 0.25 en self-play symétrique (on joue
+# contre soi-même). Pour une métrique ABSOLUE de progression, on lance périodiquement
+# une partie isolée : 1 learner greedy (la politique réellement déployée, cf. main.py)
+# contre 3 bots aléatoires. Matchmaking FIFO ⇒ les 4 bots d'éval, rejoignant ensemble
+# pendant que les bots de training sont en partie, sont regroupés dans la même partie.
+EVAL_EVERY        = 10   # lancer une partie d'éval tous les N updates PPO
+EVAL_WINDOW       = 50   # fenêtre glissante de l'eval win-rate
+EVAL_LEARNER_COLOR = ALL_COLORS[0]  # couleur du bot greedy dans le quatuor d'éval
+
 COLORS = ALL_COLORS  # 4 joueurs : 1 learner (red) + 3 adversaires
+
+
+# ── Normalisation des retours (robustesse du critique) ────────────────────────
+
+class RunningMeanStd:
+    """Moyenne/variance courantes (algo de Welford) sur les retours.
+    Le critique apprend à prédire des retours STANDARDISÉS (moy 0, écart-type 1),
+    ce qui borne l'amplitude de la value loss quelle que soit l'échelle des rewards
+    — complément de la réduction ÷10 : robuste même si cette estimation dérive."""
+
+    def __init__(self):
+        self.mean  = 0.0
+        self.var   = 1.0
+        self.count = 1e-4
+
+    def update(self, x: torch.Tensor):
+        batch_mean  = float(x.mean())
+        batch_var   = float(x.var(unbiased=False))
+        batch_count = x.numel()
+        delta      = batch_mean - self.mean
+        tot        = self.count + batch_count
+        self.mean += delta * batch_count / tot
+        m_a        = self.var * self.count
+        m_b        = batch_var * batch_count
+        m2         = m_a + m_b + delta**2 * self.count * batch_count / tot
+        self.var   = m2 / tot
+        self.count = tot
+
+    @property
+    def std(self) -> float:
+        return (self.var ** 0.5) + 1e-8
+
+    def normalize(self, x):
+        return (x - self.mean) / self.std
+
+    def denormalize(self, x):
+        return x * self.std + self.mean
 
 
 # ── Rollout par bot (trajectoire d'une partie) ────────────────────────────────
@@ -138,9 +187,15 @@ class PPOAgent:
         self.n_games    = 0
         self.pool: list[MercuryNet] = []   # snapshots gelés (pool d'adversaires)
         self._inference_lock = threading.Lock()  # protège net pendant updates
+        # Stats courantes des retours : le critique prédit des retours standardisés.
+        self.ret_rms = RunningMeanStd()
         # Fenêtre glissante des résultats des bots learner (1 = gagné, 0 = perdu).
-        # Métrique de référence : doit dépasser 0.25 (hasard à 4 joueurs) si l'agent progresse.
+        # En self-play symétrique elle tend vers ~0.25 (on joue contre ses clones) :
+        # c'est un indicateur de stabilité, PAS de progression absolue.
         self.recent_wins = deque(maxlen=WINRATE_WINDOW)
+        # Win-rate du learner greedy vs 3 bots aléatoires : LA métrique de progression
+        # absolue. Doit grimper bien au-dessus de 0.25 si l'agent apprend réellement.
+        self.eval_wins = deque(maxlen=EVAL_WINDOW)
         self._load()
 
     def _load(self):
@@ -184,7 +239,10 @@ class PPOAgent:
                 dist, value = self.net(state, legal)
                 action      = dist.sample()
                 log_prob    = dist.log_prob(action)
-        return action.item(), log_prob.item(), value.item()
+        # Le critique prédit des retours STANDARDISÉS → dénormaliser pour que GAE
+        # (compute_gae) opère dans l'espace brut des récompenses (cohérence rewards/values).
+        value = self.ret_rms.denormalize(value.item())
+        return action.item(), log_prob.item(), value
 
     def update(self):
         n = len(self.buffer)
@@ -199,6 +257,12 @@ class PPOAgent:
         returns    = torch.tensor(self.buffer.returns,    dtype=torch.float32)
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+        # Le critique prédit des retours STANDARDISÉS : on met à jour les stats courantes
+        # puis on normalise les cibles. La value loss reste ainsi d'amplitude O(1) quelle
+        # que soit l'échelle des récompenses (complément robuste de la réduction ÷10).
+        self.ret_rms.update(returns)
+        returns_norm = self.ret_rms.normalize(returns)
 
         # Métriques accumulées sur tous les mini-batches de l'update (pour le log).
         sum_p_loss = sum_v_loss = sum_entropy = sum_kl = 0.0
@@ -219,7 +283,8 @@ class PPOAgent:
                     surr    = torch.min(ratio * adv,
                                         ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * adv)
                     p_loss  = -surr.mean()
-                    v_loss  = F.mse_loss(values, returns[idx])
+                    # values et returns_norm sont tous deux en espace STANDARDISÉ.
+                    v_loss  = F.mse_loss(values, returns_norm[idx])
                     loss    = p_loss + VALUE_COEF * v_loss - ENTROPY_COEF * entropy
 
                     self.optimizer.zero_grad()
@@ -384,7 +449,7 @@ class RLBot:
         if self.is_learner:
             self.agent.recent_wins.append(1 if won else 0)
         result = "GAGNÉ" if won else "perdu"
-        print(f"[{self.name}] {result} (gagnant : {winner})")
+        # print(f"[{self.name}] {result} (gagnant : {winner})")
         return True
 
     async def run(self, ws):
@@ -467,6 +532,102 @@ class RLBot:
                 continue
 
 
+# ── Bot d'évaluation (greedy learner OU random, sans gradient) ──────────────────
+
+class EvalBot:
+    """Bot d'une partie d'évaluation. Ne touche NI au buffer NI à recent_wins.
+      - is_greedy=True  : joue argmax sur le réseau courant (politique déployée).
+      - is_greedy=False : joue un coup légal uniformément au hasard (baseline).
+    Seul le résultat du bot greedy est enregistré (agent.eval_wins)."""
+
+    def __init__(self, agent: PPOAgent, bot_id: str, name: str, is_greedy: bool):
+        self.agent     = agent
+        self.is_greedy = is_greedy
+        self.bot_id    = bot_id
+        self.name      = name
+        self.color     = None
+        self._over     = False
+
+    def _resolve_color(self, gs: dict) -> bool:
+        for p in gs['players']:
+            if p.get('userId') == self.bot_id:
+                self.color = p['color']
+                return True
+        return False
+
+    async def _join(self, ws):
+        await ws.send(json.dumps({
+            "type":       "joinMatchmaking",
+            "playerName": self.name,
+            "browserId":  self.bot_id,
+            "userId":     self.bot_id,
+        }))
+
+    def _pick_action(self, gs: dict, mask: list[bool]) -> int:
+        legal_idx = [i for i, ok in enumerate(mask) if ok]
+        if not self.is_greedy:
+            return random.choice(legal_idx)
+        # Greedy : argmax de la politique du réseau courant (cf. main.py / prod).
+        state_enc = encode_state(gs, self.color)
+        legal     = torch.tensor(mask, dtype=torch.bool)
+        with torch.no_grad():
+            with self.agent._inference_lock:
+                dist, _ = self.agent.net(state_enc, legal)
+                return int(torch.argmax(dist.probs).item())
+
+    def _on_end(self, winner: str | None):
+        if self._over:
+            return
+        self._over = True
+        if self.is_greedy:
+            self.agent.eval_wins.append(1 if winner == self.color else 0)
+
+    async def run(self, ws):
+        await self._join(ws)
+        async for raw in ws:
+            try:
+                msg = json.loads(raw)
+                if msg.get("type") == "actionPlayed":
+                    continue
+                if msg.get("type") == "gameEnded":
+                    self._on_end(msg.get("winner"))
+                    return
+                if msg.get("type") != "gameState":
+                    continue
+
+                gs = msg["gameState"]
+                if not self._resolve_color(gs):
+                    continue
+                winner = _detect_winner(gs)
+                if winner is not None:
+                    self._on_end(winner)
+                    return
+                if gs["currentTurn"] != self.color:
+                    continue
+
+                hand         = gs.get("hand", [])
+                mbc          = _marbles_by_color(gs)
+                my_marbles   = mbc[self.color]
+                inv_by_color = _invincible_by_color(gs)
+                mask, _ = get_legal_mask(
+                    hand, my_marbles, self.color, mbc,
+                    invincible_by_color=inv_by_color,
+                    can_discard=gs.get("canDiscard", False),
+                )
+                if not any(mask):
+                    continue
+
+                action  = self._pick_action(gs, mask)
+                msg_out = build_server_message(
+                    action, hand, my_marbles, self.color, mbc,
+                    invincible_by_color=inv_by_color,
+                )
+                await ws.send(json.dumps(msg_out))
+            except Exception as e:
+                print(f"[{self.name}] erreur éval: {e!r}")
+                continue
+
+
 # ── Boucle d'entraînement ─────────────────────────────────────────────────────
 
 async def run_training():
@@ -494,11 +655,45 @@ async def run_training():
                 print(f"[{name}] connexion perdue ({e}), reconnexion…")
                 await asyncio.sleep(2)
 
+    async def run_eval_game():
+        """Une partie d'éval isolée : 1 learner greedy + 3 bots aléatoires.
+        Les 4 bots rejoignent en même temps ; matchmaking FIFO ⇒ même partie
+        (les 4 bots de training sont alors occupés dans leur propre partie)."""
+        bots = []
+        for color in COLORS:
+            is_greedy = (color == EVAL_LEARNER_COLOR)
+            bot_id = f"eval-bot-{color}"
+            name   = f"EVAL-{'NET' if is_greedy else 'RND'}-{color.capitalize()}"
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"{API_URL}/api/auth/bot",
+                    json={"secret": BOT_SECRET, "botId": bot_id, "name": name},
+                )
+            bots.append(EvalBot(agent, bot_id, name, is_greedy=is_greedy))
+
+        async def play(bot: EvalBot):
+            try:
+                async with websockets.connect(WS_URL) as ws:
+                    await bot.run(ws)
+            except Exception as e:
+                print(f"[{bot.name}] éval connexion perdue ({e})")
+
+        await asyncio.gather(*(play(b) for b in bots))
+        if agent.eval_wins:
+            rate = sum(agent.eval_wins) / len(agent.eval_wins)
+            print(f"[EVAL] vs random : win_rate={rate:.3f} "
+                  f"(n={len(agent.eval_wins)}, dernière={agent.eval_wins[-1]})")
+
     async def update_loop():
+        last_eval = 0
         while True:
             await asyncio.sleep(2)
             if len(agent.buffer) >= UPDATE_EVERY:
                 agent.update()
+                if agent.n_updates - last_eval >= EVAL_EVERY:
+                    last_eval = agent.n_updates
+                    # Lancer en tâche de fond : ne pas bloquer la boucle d'update.
+                    asyncio.create_task(run_eval_game())
 
     await asyncio.gather(
         *[run_bot(color) for color in COLORS],

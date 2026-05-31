@@ -12,40 +12,33 @@ from mercury_legal_moves import (
 _ALL_HOME = {p for positions in HOME_POSITIONS.values() for p in positions}
 
 # ── Coefficients du shaping ───────────────────────────────────────────────────
-# Placés en haut pour faciliter le tuning ultérieur.
-OWN_PROGRESS_COEF    = 0.6   # gain/perte de progrès sur mes billes
-                              # (réduit de 1.5 : évite que l'avancement dense domine la victoire)
-OPP_PROGRESS_COEF    = 1.0   # progrès perdu par un adversaire (capture + swap + 4)
-OPP_ARRIVAL_PENALTY  = 0.15  # malus fixe par bille adverse entrant en zone d'arrivée
-OPP_ARRIVAL_SCALE    = 0.10  # malus additionnel par bille déjà arrivée chez l'adversaire
-THREAT_PENALTY       = 0.05  # malus si une bille à moi est à portée d'un adversaire
-THREAT_RANGE         = 6     # distance (en cases) considérée comme menaçante
-# Bonus d'entrée explicite : faire entrer une bille en jeu est rare et débloquant
-# (sans bille en jeu on passe son tour). On le garde volontairement gros : il doit
-# largement dominer "advance-1" (≈0.017) pour que l'agent utilise l'As/le Roi pour
-# entrer plutôt que pour grappiller une case.
-ENTRY_BONUS          = 1.0
-# Bonus d'arrivée : faire rentrer une bille en zone d'arrivée est l'une des étapes
-# les plus importantes du jeu (4 billes arrivées = victoire). C'est la 2ème plus
-# grosse récompense après la victoire, nettement au-dessus de l'entrée (+1) et du
-# recul adverse (+1). Déclenché une seule fois, au passage main path → zone d'arrivée.
-ARRIVAL_BONUS        = 3.0
+# ÉCHELLE ÷10 (vs la version précédente) : les retours s'étalent désormais sur ~±3
+# au lieu de ~±30, ce qui rend la value loss du critique FITTABLE (le v_loss restait
+# bloqué ~45 avec WIN=±30). La HIÉRARCHIE est strictement préservée — c'est l'ordre
+# relatif des récompenses qui guide la politique, pas leur valeur absolue.
+#     victoire ≫ arrivée > entrée > recul/capture adverse > progrès case-par-case
+OWN_PROGRESS_COEF    = 0.06  # gain/perte de progrès sur mes billes (plus petit signal)
+OPP_PROGRESS_COEF    = 0.1   # progrès perdu par un adversaire (capture + swap + 4)
+OPP_ARRIVAL_PENALTY  = 0.015 # malus fixe par bille adverse entrant en zone d'arrivée
+OPP_ARRIVAL_SCALE    = 0.01  # malus additionnel par bille déjà arrivée chez l'adversaire
+THREAT_PENALTY       = 0.005 # malus si une bille à moi est à portée d'un adversaire
+THREAT_RANGE         = 6     # distance (en cases) considérée comme menaçante — INCHANGÉ
+# Bonus d'entrée : faire entrer une bille est rare et débloquant (sans bille en jeu on
+# passe son tour). Reste largement au-dessus de "advance-1" (≈0.0017 à cette échelle).
+ENTRY_BONUS          = 0.1
+# Bonus d'arrivée : 2ème plus grosse récompense après la victoire (4 arrivées = victoire).
+ARRIVAL_BONUS        = 0.3
 
 # ── Calibration WIN/LOSS ──────────────────────────────────────────────────────
 # IMPORTANT — la 4ᵉ arrivée DÉCLENCHE la victoire : l'événement "arriver sa dernière
 # bille" est donc payé deux fois (ARRIVAL_BONUS au dernier flush + WIN_REWARD terminal).
-# Pour que l'agent optimise réellement GAGNER (et pas seulement "farmer des arrivées"),
 # WIN doit dominer la somme MAXIMALE des récompenses denses d'une partie gagnante :
-#     4×ENTRY (4.0) + 4×ARRIVAL (12.0) + progrès own max (~2.4 = 4×1.0×0.6)
-#     + captures/reculs adverses (variable, ~+1 à +3)   ≈  +18 à +20
-# On fixe donc WIN = +30 (≈ 1.5× le plafond dense) pour rester strictement dominant.
-# Si en pratique la somme dense observée dépasse +20, monter WIN à +40 plutôt que de
-# rogner ENTRY/ARRIVAL (qui restent des objectifs de jeu légitimes).
-WIN_REWARD           = 30.0
-# Symétrie : sans un LOSS aussi fort, les retours restent biaisés positifs (le dense
-# est presque toujours ≥ 0), le critique apprend une baseline haute et l'avantage
-# discrimine mal gagner/perdre.
-LOSS_REWARD          = -30.0
+#     4×ENTRY (0.4) + 4×ARRIVAL (1.2) + progrès own max (~0.24) + captures (~0.1-0.3)
+#     ≈ +1.8 à +2.0
+# On fixe WIN = +3 (≈ 1.5× le plafond dense) → strictement dominant, et retours ~±3
+# (échelle confortable pour le critique). LOSS symétrique pour éviter le biais positif.
+WIN_REWARD           = 3.0
+LOSS_REWARD          = -3.0
 
 
 def marble_progress(pos: int, color: str) -> float:
