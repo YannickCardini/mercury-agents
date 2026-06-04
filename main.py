@@ -31,7 +31,7 @@ from mercury_legal_moves import (
     get_legal_mask, build_server_message,
     ARRIVAL_POSITIONS,
 )
-from model import MercuryNet, encode_state
+from model import MercuryNet, encode_state, load_net
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -55,13 +55,13 @@ BOT_IDENTITIES: list[dict] = [{"botId": str(i)} for i in range(1, 28)]
 
 # ── Modèle ────────────────────────────────────────────────────────────────────
 
-def load_model() -> MercuryNet:
+def load_model():
     if not MODEL_PATH.exists():
         raise FileNotFoundError(f"Modèle introuvable : {MODEL_PATH}")
-    net = MercuryNet()
-    net.load_state_dict(torch.load(MODEL_PATH, weights_only=True, map_location="cpu"))
-    net.eval()
-    print(f"[model] chargé depuis {MODEL_PATH}")
+    # load_net auto-détecte l'architecture (MercuryNet courant 3×384 OU MercuryNetLegacy
+    # 2×256 des anciens modèles) → la prod reste compatible quel que soit le modèle déployé.
+    net = load_net(MODEL_PATH, map_location="cpu", eval_mode=True)
+    print(f"[model] chargé depuis {MODEL_PATH} ({type(net).__name__})")
     return net
 
 

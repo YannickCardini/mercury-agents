@@ -1,6 +1,7 @@
 """
 Réseau de politique et valeur pour le bot RL Mercury.
-Architecture : 2 couches de 256 unités, sortie pour 501 actions + valeur scalaire.
+Architecture courante (MercuryNet) : 3 couches + LayerNorm, têtes policy/value séparées.
+Architecture historique (MercuryNetLegacy) : 2×256 ReLU — chargement des anciens modèles.
 """
 
 import torch
@@ -118,58 +119,87 @@ def _marble_progress_norm(pos: int, color: str) -> float:
 
 # ── Réseau de politique-valeur ────────────────────────────────────────────────
 
+def _apply_mask_dist(logits: torch.Tensor, legal_mask: torch.Tensor) -> Categorical:
+    """Masque les actions illégales (-inf) puis construit la Categorical.
+    Factorisé pour être partagé par MercuryNet et MercuryNetLegacy."""
+    logits = logits.masked_fill(~legal_mask, float('-inf'))
+    return Categorical(F.softmax(logits, dim=-1))
+
+
 class MercuryNet(nn.Module):
     """
     Réseau PPO : politique + valeur.
-    Entrée : état (STATE_DIM), masque légal (ACTION_DIM).
-    Sortie : distribution catégorique (actions légales), valeur scalaire.
+    Architecture IDENTIQUE au legacy (2 couches, ReLU nu, têtes directes) — c'est la
+    config prouvée qui converge (eval 0.82). SEUL changement isolé : hidden_dim 256→384.
+    On teste UN facteur à la fois : la tentative précédente (3 couches + LayerNorm +
+    têtes séparées, tout d'un coup) bloquait l'apprentissage (entropie ~2.0). Si 384
+    converge, on ajoutera le facteur suivant ensuite.
+    Encodage d'entrée inchangé (STATE_DIM=54, le meilleur connu).
     """
 
-    def __init__(self, hidden_dim: int = 256):
+    def __init__(self, hidden_dim: int = 384):
         super().__init__()
         self.hidden_dim = hidden_dim
-
-        # Backbone partagé
         self.fc1 = nn.Linear(STATE_DIM, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-
-        # Tête de politique
         self.policy_head = nn.Linear(hidden_dim, ACTION_DIM)
+        self.value_head  = nn.Linear(hidden_dim, 1)
 
-        # Tête de valeur
-        self.value_head = nn.Linear(hidden_dim, 1)
-
-    def forward(self, state: torch.Tensor, legal_mask: torch.Tensor
-                ) -> tuple:
-        """
-        Args:
-            state : shape (STATE_DIM,) ou (batch, STATE_DIM)
-            legal_mask : shape (ACTION_DIM,) ou (batch, ACTION_DIM), bool
-
-        Returns:
-            (dist, value) où dist est une Categorical et value un float/tensor
-        """
+    def forward(self, state: torch.Tensor, legal_mask: torch.Tensor) -> tuple:
         is_batch = state.dim() == 2
         if not is_batch:
             state = state.unsqueeze(0)
             legal_mask = legal_mask.unsqueeze(0)
-
-        # Backbone
         h = F.relu(self.fc1(state))
         h = F.relu(self.fc2(h))
-
-        # Politique
-        logits = self.policy_head(h)
-
-        # Masquer les actions illégales
-        logits = logits.masked_fill(~legal_mask, float('-inf'))
-        probs = F.softmax(logits, dim=-1)
-        dist = Categorical(probs)
-
-        # Valeur — squeeze la dim de sortie (…, 1) → (…,) pour matcher returns
+        dist  = _apply_mask_dist(self.policy_head(h), legal_mask)
         value = self.value_head(h).squeeze(-1)
-
         if not is_batch:
             value = value.squeeze(0)
-
         return dist, value
+
+
+class MercuryNetLegacy(nn.Module):
+    """Architecture HISTORIQUE (2×256, ReLU nu) — conservée UNIQUEMENT pour charger
+    les anciens checkpoints (ex. model_ref_082.pt, l'agent 0.82 en prod) comme
+    adversaire de duel. Ne sert plus à l'entraînement."""
+
+    def __init__(self, hidden_dim: int = 256):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.fc1 = nn.Linear(STATE_DIM, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.policy_head = nn.Linear(hidden_dim, ACTION_DIM)
+        self.value_head  = nn.Linear(hidden_dim, 1)
+
+    def forward(self, state: torch.Tensor, legal_mask: torch.Tensor) -> tuple:
+        is_batch = state.dim() == 2
+        if not is_batch:
+            state = state.unsqueeze(0)
+            legal_mask = legal_mask.unsqueeze(0)
+        h = F.relu(self.fc1(state))
+        h = F.relu(self.fc2(h))
+        dist  = _apply_mask_dist(self.policy_head(h), legal_mask)
+        value = self.value_head(h).squeeze(-1)
+        if not is_batch:
+            value = value.squeeze(0)
+        return dist, value
+
+
+# ── Chargement auto-détectant l'architecture ──────────────────────────────────
+
+def load_net(path, map_location="cpu", eval_mode: bool = True) -> nn.Module:
+    """Charge un checkpoint (dict {net,...} ou state_dict brut) dans la BONNE
+    architecture, auto-détectée par la LARGEUR du backbone (`fc1.weight` → hidden_dim) :
+      - hidden_dim == 256 → MercuryNetLegacy (anciens modèles, ex. model_ref_082.pt)
+      - sinon              → MercuryNet (largeur courante, ex. 384)
+    MercuryNet et MercuryNetLegacy partagent désormais la même STRUCTURE (2 couches,
+    têtes directes) ; seule la largeur les distingue. Renvoie le réseau prêt (eval)."""
+    ckpt  = torch.load(path, weights_only=True, map_location=map_location)
+    state = ckpt['net'] if isinstance(ckpt, dict) and 'net' in ckpt else ckpt
+    hidden = state['fc1.weight'].shape[0]
+    net = MercuryNetLegacy(hidden) if hidden == 256 else MercuryNet(hidden)
+    net.load_state_dict(state)
+    if eval_mode:
+        net.eval()
+    return net

@@ -7,7 +7,7 @@ Lancer :
   python bot_rl.py
 """
 
-import asyncio, json, pathlib, random, threading
+import asyncio, json, os, pathlib, random, threading
 import concurrent.futures, functools
 from collections import deque
 import torch
@@ -20,7 +20,7 @@ from mercury_legal_moves import (
     ARRIVAL_POSITIONS, HOME_POSITIONS, ALL_COLORS,
 )
 from reward  import compute_reward, terminal_reward
-from model   import MercuryNet, encode_state, ACTION_DIM, STATE_DIM
+from model   import MercuryNet, encode_state, load_net, ACTION_DIM, STATE_DIM
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -42,8 +42,10 @@ UPDATE_EVERY = 512
 PPO_EPOCHS   = 4
 BATCH_SIZE   = 64
 
-POOL_SIZE      = 5    # snapshots du passé conservés en mémoire
-SNAPSHOT_EVERY = 10   # sauvegarder un snapshot tous les N updates
+POOL_SIZE      = 18   # snapshots du passé conservés (élargi 5→18 : plus de diversité
+                      # d'adversaires, réduit l'oubli catastrophique et l'oscillation)
+SNAPSHOT_EVERY = 25   # snapshot tous les N updates (espacé 10→25 : couvre un historique
+                      # plus large avec le même nombre de snapshots conservés)
 WINRATE_WINDOW = 200  # fenêtre glissante pour la win-rate des bots learner
 LEARNER_PROB   = 0.6  # proba qu'un bot joue le réseau courant (→ learner) par partie
                       # ⇒ ~2-3 des 4 bots alimentent le gradient ; le reste = pool gelé
@@ -58,44 +60,19 @@ EVAL_EVERY        = 10   # lancer une partie d'éval tous les N updates PPO
 EVAL_WINDOW       = 50   # fenêtre glissante de l'eval win-rate
 EVAL_LEARNER_COLOR = ALL_COLORS[0]  # couleur du bot greedy dans le quatuor d'éval
 
+# ── Duel vs l'agent de référence (la version 0.82 en prod) ──────────────────────
+# Métrique du VRAI critère : un candidat ne remplace la prod que s'il bat le ref en
+# duel direct. Partie isolée : 2 bots jouent le réseau courant, 2 jouent le ref figé
+# (positions en diagonale). On mesure la win-rate du réseau courant.
+REF_MODEL_PATH = pathlib.Path("model_ref_082.pt")  # référence figée (agent 0.82 prod)
+DUEL_EVERY     = 20   # lancer un duel tous les N updates PPO
+DUEL_WINDOW    = 50   # fenêtre glissante de la win-rate de duel
+DUEL_REPLACE_THRESHOLD = 0.55  # seuil de supériorité pour considérer un remplacement prod
+# Couleurs jouées par le réseau COURANT dans le duel (les 2 autres jouent le ref).
+# En diagonale pour neutraliser tout biais de position de départ.
+DUEL_CURRENT_COLORS = {ALL_COLORS[0], ALL_COLORS[2]}
+
 COLORS = ALL_COLORS  # 4 joueurs : 1 learner (red) + 3 adversaires
-
-
-# ── Normalisation des retours (robustesse du critique) ────────────────────────
-
-class RunningMeanStd:
-    """Moyenne/variance courantes (algo de Welford) sur les retours.
-    Le critique apprend à prédire des retours STANDARDISÉS (moy 0, écart-type 1),
-    ce qui borne l'amplitude de la value loss quelle que soit l'échelle des rewards
-    — complément de la réduction ÷10 : robuste même si cette estimation dérive."""
-
-    def __init__(self):
-        self.mean  = 0.0
-        self.var   = 1.0
-        self.count = 1e-4
-
-    def update(self, x: torch.Tensor):
-        batch_mean  = float(x.mean())
-        batch_var   = float(x.var(unbiased=False))
-        batch_count = x.numel()
-        delta      = batch_mean - self.mean
-        tot        = self.count + batch_count
-        self.mean += delta * batch_count / tot
-        m_a        = self.var * self.count
-        m_b        = batch_var * batch_count
-        m2         = m_a + m_b + delta**2 * self.count * batch_count / tot
-        self.var   = m2 / tot
-        self.count = tot
-
-    @property
-    def std(self) -> float:
-        return (self.var ** 0.5) + 1e-8
-
-    def normalize(self, x):
-        return (x - self.mean) / self.std
-
-    def denormalize(self, x):
-        return x * self.std + self.mean
 
 
 # ── Rollout par bot (trajectoire d'une partie) ────────────────────────────────
@@ -187,25 +164,42 @@ class PPOAgent:
         self.n_games    = 0
         self.pool: list[MercuryNet] = []   # snapshots gelés (pool d'adversaires)
         self._inference_lock = threading.Lock()  # protège net pendant updates
-        # Stats courantes des retours : le critique prédit des retours standardisés.
-        self.ret_rms = RunningMeanStd()
         # Fenêtre glissante des résultats des bots learner (1 = gagné, 0 = perdu).
         # En self-play symétrique elle tend vers ~0.25 (on joue contre ses clones) :
         # c'est un indicateur de stabilité, PAS de progression absolue.
         self.recent_wins = deque(maxlen=WINRATE_WINDOW)
-        # Win-rate du learner greedy vs 3 bots aléatoires : LA métrique de progression
-        # absolue. Doit grimper bien au-dessus de 0.25 si l'agent apprend réellement.
+        # Win-rate du learner greedy vs 3 bots aléatoires : métrique absolue (thermomètre).
         self.eval_wins = deque(maxlen=EVAL_WINDOW)
+        # Win-rate du réseau courant vs l'agent de référence (0.82 prod) en duel direct :
+        # LE critère de remplacement prod. Un candidat doit dépasser DUEL_REPLACE_THRESHOLD.
+        self.duel_wins = deque(maxlen=DUEL_WINDOW)
+        self.best_duel = 0.0   # meilleur duel_rate vu → déclenche l'auto-save model_best.pt
+        # Réseau de référence figé pour le duel (chargé dans sa propre architecture via
+        # load_net : le ref est un ancien MercuryNetLegacy 2×256).
+        self.ref_net = load_net(REF_MODEL_PATH) if REF_MODEL_PATH.exists() else None
+        if self.ref_net is None:
+            print(f"[duel] {REF_MODEL_PATH} introuvable → duel désactivé")
         self._load()
 
     def _load(self):
-        if MODEL_PATH.exists():
-            try:
-                self.net.load_state_dict(torch.load(MODEL_PATH, weights_only=True))
-                print(f"Modèle chargé depuis {MODEL_PATH}")
-            except RuntimeError:
-                print(f"Checkpoint incompatible (STATE_DIM changé ?), repartir de zéro.")
-                MODEL_PATH.unlink()
+        if not MODEL_PATH.exists():
+            return
+        try:
+            ckpt = torch.load(MODEL_PATH, weights_only=True)
+            # Nouveau format : dict {net, n_updates, n_games}.
+            # Ancien format (rétro-compat) : state_dict brut du réseau.
+            if isinstance(ckpt, dict) and 'net' in ckpt:
+                self.net.load_state_dict(ckpt['net'])
+                self.n_updates = ckpt.get('n_updates', 0)
+                self.n_games   = ckpt.get('n_games', 0)
+                print(f"Checkpoint chargé depuis {MODEL_PATH} "
+                      f"(updates={self.n_updates}, games={self.n_games})")
+            else:
+                self.net.load_state_dict(ckpt)
+                print(f"Modèle chargé depuis {MODEL_PATH} (ancien format state_dict brut)")
+        except RuntimeError:
+            print(f"Checkpoint incompatible (STATE_DIM changé ?), repartir de zéro.")
+            MODEL_PATH.unlink()
 
     def _save_snapshot(self):
         """Gèle une copie du réseau courant dans le pool et sur disque."""
@@ -221,6 +215,35 @@ class PPOAgent:
         snaps = sorted(MODEL_DIR.glob("snapshot_*.pt"))
         for old in snaps[:-POOL_SIZE]:
             old.unlink(missing_ok=True)
+
+    def _save_checkpoint(self):
+        """Sauvegarde ATOMIQUE de {net, n_updates, n_games}.
+        Écriture fichier temp + os.replace : une coupure de courant pendant l'écriture
+        laisse soit l'ancien fichier intact, soit le nouveau complet — jamais un fichier
+        tronqué."""
+        ckpt = {
+            'net':       self.net.state_dict(),
+            'n_updates': self.n_updates,
+            'n_games':   self.n_games,
+        }
+        tmp = MODEL_PATH.with_suffix('.pt.tmp')
+        torch.save(ckpt, tmp)
+        os.replace(tmp, MODEL_PATH)   # atomique sur le même système de fichiers
+
+    def save_best(self, duel_rate: float):
+        """Sauvegarde model_best.pt si `duel_rate` bat le record (capture le pic, qu'on
+        perdait jusqu'ici quand la métrique oscillait). Écriture atomique."""
+        if duel_rate <= self.best_duel:
+            return
+        self.best_duel = duel_rate
+        best_path = pathlib.Path("model_best.pt")
+        ckpt = {'net': self.net.state_dict(),
+                'n_updates': self.n_updates, 'n_games': self.n_games,
+                'duel_rate': duel_rate}
+        tmp = best_path.with_suffix('.pt.tmp')
+        torch.save(ckpt, tmp)
+        os.replace(tmp, best_path)
+        print(f"[BEST] nouveau record duel={duel_rate:.3f} → {best_path}")
 
     def sample_opponent_net(self) -> MercuryNet:
         """Tire aléatoirement un snapshot GELÉ du pool (jamais le réseau courant).
@@ -239,10 +262,7 @@ class PPOAgent:
                 dist, value = self.net(state, legal)
                 action      = dist.sample()
                 log_prob    = dist.log_prob(action)
-        # Le critique prédit des retours STANDARDISÉS → dénormaliser pour que GAE
-        # (compute_gae) opère dans l'espace brut des récompenses (cohérence rewards/values).
-        value = self.ret_rms.denormalize(value.item())
-        return action.item(), log_prob.item(), value
+        return action.item(), log_prob.item(), value.item()
 
     def update(self):
         n = len(self.buffer)
@@ -258,11 +278,10 @@ class PPOAgent:
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        # Le critique prédit des retours STANDARDISÉS : on met à jour les stats courantes
-        # puis on normalise les cibles. La value loss reste ainsi d'amplitude O(1) quelle
-        # que soit l'échelle des récompenses (complément robuste de la réduction ÷10).
-        self.ret_rms.update(returns)
-        returns_norm = self.ret_rms.normalize(returns)
+        # Le critique prédit directement les retours BRUTS. Inutile de normaliser : avec
+        # l'échelle de récompenses ÷10 (reward.py), les retours sont déjà d'amplitude ~±3,
+        # parfaitement fittable. (Une normalisation par moyenne courante finissait par se
+        # figer — count → ∞ — et désalignait le critique.)
 
         # Métriques accumulées sur tous les mini-batches de l'update (pour le log).
         sum_p_loss = sum_v_loss = sum_entropy = sum_kl = 0.0
@@ -283,8 +302,7 @@ class PPOAgent:
                     surr    = torch.min(ratio * adv,
                                         ratio.clamp(1 - CLIP_EPS, 1 + CLIP_EPS) * adv)
                     p_loss  = -surr.mean()
-                    # values et returns_norm sont tous deux en espace STANDARDISÉ.
-                    v_loss  = F.mse_loss(values, returns_norm[idx])
+                    v_loss  = F.mse_loss(values, returns[idx])
                     loss    = p_loss + VALUE_COEF * v_loss - ENTROPY_COEF * entropy
 
                     self.optimizer.zero_grad()
@@ -303,7 +321,7 @@ class PPOAgent:
 
         self.buffer.clear()
         self.n_updates += 1
-        torch.save(self.net.state_dict(), MODEL_PATH)
+        self._save_checkpoint()   # atomique : {net, n_updates, n_games}
         if self.n_updates % SNAPSHOT_EVERY == 0:
             self._save_snapshot()
 
@@ -532,21 +550,28 @@ class RLBot:
                 continue
 
 
-# ── Bot d'évaluation (greedy learner OU random, sans gradient) ──────────────────
+# ── Bot d'évaluation (greedy sur un réseau donné OU random, sans gradient) ──────
 
 class EvalBot:
-    """Bot d'une partie d'évaluation. Ne touche NI au buffer NI à recent_wins.
-      - is_greedy=True  : joue argmax sur le réseau courant (politique déployée).
-      - is_greedy=False : joue un coup légal uniformément au hasard (baseline).
-    Seul le résultat du bot greedy est enregistré (agent.eval_wins)."""
+    """Bot d'une partie d'éval/duel. Ne touche NI au buffer NI à recent_wins.
+      - mode='random'  : joue un coup légal uniformément au hasard (baseline).
+      - mode='net'     : joue argmax sur le réseau `net` fourni (greedy, comme la prod).
+    Si `result_sink` (deque) est fourni, le résultat du bot (1=gagné, 0=perdu) y est
+    ajouté en fin de partie. Sert à la fois pour l'éval vs random (1 net + 3 random,
+    sink sur le net) et le duel (2 courant + 2 ref, sink sur le courant).
+    `agent` n'est utilisé que pour le verrou d'inférence (protège net pendant updates)."""
 
-    def __init__(self, agent: PPOAgent, bot_id: str, name: str, is_greedy: bool):
-        self.agent     = agent
-        self.is_greedy = is_greedy
-        self.bot_id    = bot_id
-        self.name      = name
-        self.color     = None
-        self._over     = False
+    def __init__(self, agent: PPOAgent, bot_id: str, name: str, mode: str,
+                 net=None, result_sink=None):
+        self.agent       = agent
+        self.mode        = mode          # 'random' | 'net'
+        self.net         = net           # réseau à jouer si mode == 'net'
+        self.result_sink = result_sink   # deque où enregistrer le résultat (ou None)
+        self.bot_id      = bot_id
+        self.name        = name
+        self.color       = None
+        self._over       = False
+        self._won_color  = None          # couleur gagnante de la partie (lue après coup)
 
     def _resolve_color(self, gs: dict) -> bool:
         for p in gs['players']:
@@ -565,22 +590,23 @@ class EvalBot:
 
     def _pick_action(self, gs: dict, mask: list[bool]) -> int:
         legal_idx = [i for i, ok in enumerate(mask) if ok]
-        if not self.is_greedy:
+        if self.mode == 'random':
             return random.choice(legal_idx)
-        # Greedy : argmax de la politique du réseau courant (cf. main.py / prod).
+        # Greedy : argmax de la politique du réseau fourni (cf. main.py / prod).
         state_enc = encode_state(gs, self.color)
         legal     = torch.tensor(mask, dtype=torch.bool)
         with torch.no_grad():
-            with self.agent._inference_lock:
-                dist, _ = self.agent.net(state_enc, legal)
+            with self.agent._inference_lock:  # le réseau courant peut être en cours d'update
+                dist, _ = self.net(state_enc, legal)
                 return int(torch.argmax(dist.probs).item())
 
     def _on_end(self, winner: str | None):
         if self._over:
             return
         self._over = True
-        if self.is_greedy:
-            self.agent.eval_wins.append(1 if winner == self.color else 0)
+        self._won_color = winner
+        if self.result_sink is not None:
+            self.result_sink.append(1 if winner == self.color else 0)
 
     async def run(self, ws):
         await self._join(ws)
@@ -633,6 +659,9 @@ class EvalBot:
 async def run_training():
     agent = PPOAgent()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+    # Sérialise éval et duel : deux parties isolées ne doivent jamais être en file
+    # de matchmaking en même temps (FIFO les mélangerait dans une même partie).
+    isolated_lock = asyncio.Lock()
 
     # Plus de rôle fixe par couleur : chaque bot tire son rôle PAR PARTIE dans
     # _reset_episode (réseau courant → learner, ou snapshot du pool → adversaire figé).
@@ -655,45 +684,89 @@ async def run_training():
                 print(f"[{name}] connexion perdue ({e}), reconnexion…")
                 await asyncio.sleep(2)
 
+    async def _play_isolated_game(bots: list):
+        """Lance les 4 bots fournis en parallèle sur des WS séparées. Le matchmaking
+        FIFO les regroupe (les 4 bots de training sont occupés ailleurs). Sert pour
+        l'éval vs random ET le duel vs ref. Sérialisé via isolated_lock pour qu'éval et
+        duel ne se mélangent jamais dans la file de matchmaking."""
+        async with isolated_lock:
+            for bot in bots:
+                async with httpx.AsyncClient() as client:
+                    await client.post(
+                        f"{API_URL}/api/auth/bot",
+                        json={"secret": BOT_SECRET, "botId": bot.bot_id, "name": bot.name},
+                    )
+
+            async def play(bot: EvalBot):
+                try:
+                    async with websockets.connect(WS_URL) as ws:
+                        await bot.run(ws)
+                except Exception as e:
+                    print(f"[{bot.name}] partie isolée perdue ({e})")
+
+            await asyncio.gather(*(play(b) for b in bots))
+
     async def run_eval_game():
-        """Une partie d'éval isolée : 1 learner greedy + 3 bots aléatoires.
-        Les 4 bots rejoignent en même temps ; matchmaking FIFO ⇒ même partie
-        (les 4 bots de training sont alors occupés dans leur propre partie)."""
+        """Éval isolée : 1 bot greedy (réseau courant) + 3 bots aléatoires."""
         bots = []
         for color in COLORS:
-            is_greedy = (color == EVAL_LEARNER_COLOR)
-            bot_id = f"eval-bot-{color}"
-            name   = f"EVAL-{'NET' if is_greedy else 'RND'}-{color.capitalize()}"
-            async with httpx.AsyncClient() as client:
-                await client.post(
-                    f"{API_URL}/api/auth/bot",
-                    json={"secret": BOT_SECRET, "botId": bot_id, "name": name},
-                )
-            bots.append(EvalBot(agent, bot_id, name, is_greedy=is_greedy))
-
-        async def play(bot: EvalBot):
-            try:
-                async with websockets.connect(WS_URL) as ws:
-                    await bot.run(ws)
-            except Exception as e:
-                print(f"[{bot.name}] éval connexion perdue ({e})")
-
-        await asyncio.gather(*(play(b) for b in bots))
+            is_net = (color == EVAL_LEARNER_COLOR)
+            bots.append(EvalBot(
+                agent, f"eval-bot-{color}",
+                f"EVAL-{'NET' if is_net else 'RND'}-{color.capitalize()}",
+                mode=('net' if is_net else 'random'),
+                net=(agent.net if is_net else None),
+                result_sink=(agent.eval_wins if is_net else None),
+            ))
+        await _play_isolated_game(bots)
         if agent.eval_wins:
             rate = sum(agent.eval_wins) / len(agent.eval_wins)
             print(f"[EVAL] vs random : win_rate={rate:.3f} "
                   f"(n={len(agent.eval_wins)}, dernière={agent.eval_wins[-1]})")
 
+    async def run_duel_game():
+        """Duel isolé : 2 bots jouent le réseau COURANT (greedy), 2 jouent le ref figé,
+        en diagonale. On enregistre UNE SEULE valeur par partie : 1 si le camp courant
+        a gagné, 0 si le camp ref a gagné (tête-à-tête). Ainsi duel_wins vaut 0.50 à
+        réseaux égaux (2 vs 2 sur 4 joueurs), et > 0.50 ⇔ le courant est supérieur."""
+        if agent.ref_net is None:
+            return
+        bots = []
+        for color in COLORS:
+            is_current = (color in DUEL_CURRENT_COLORS)
+            net = agent.net if is_current else agent.ref_net
+            # Pas de result_sink : on lit le gagnant après la partie (1 valeur/partie).
+            bots.append(EvalBot(
+                agent, f"duel-bot-{color}",
+                f"DUEL-{'CUR' if is_current else 'REF'}-{color.capitalize()}",
+                mode='net', net=net, result_sink=None,
+            ))
+        await _play_isolated_game(bots)
+        # Le gagnant est connu via le _over/color des bots : on prend le premier bot
+        # Tous les bots voient le même gagnant (stocké dans _won_color). On en déduit
+        # le camp vainqueur (courant vs ref).
+        winner_color = next((b._won_color for b in bots if b._won_color is not None), None)
+        if winner_color is None:
+            return  # partie non aboutie (déconnexion) → ne pas polluer la métrique
+        agent.duel_wins.append(1 if winner_color in DUEL_CURRENT_COLORS else 0)
+        rate = sum(agent.duel_wins) / len(agent.duel_wins)
+        agent.save_best(rate)   # capture le pic si record
+        verdict = "SUPÉRIEUR ✓" if rate > DUEL_REPLACE_THRESHOLD else ""
+        print(f"[DUEL] courant vs ref(0.82) : win_rate={rate:.3f} "
+              f"(n={len(agent.duel_wins)}, 0.50=égalité) {verdict}")
+
     async def update_loop():
-        last_eval = 0
+        last_eval = last_duel = 0
         while True:
             await asyncio.sleep(2)
             if len(agent.buffer) >= UPDATE_EVERY:
                 agent.update()
                 if agent.n_updates - last_eval >= EVAL_EVERY:
                     last_eval = agent.n_updates
-                    # Lancer en tâche de fond : ne pas bloquer la boucle d'update.
-                    asyncio.create_task(run_eval_game())
+                    asyncio.create_task(run_eval_game())  # tâche de fond, non bloquant
+                if agent.n_updates - last_duel >= DUEL_EVERY:
+                    last_duel = agent.n_updates
+                    asyncio.create_task(run_duel_game())
 
     await asyncio.gather(
         *[run_bot(color) for color in COLORS],
