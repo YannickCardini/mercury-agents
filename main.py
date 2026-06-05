@@ -31,7 +31,7 @@ from mercury_legal_moves import (
     get_legal_mask, build_server_message,
     ARRIVAL_POSITIONS,
 )
-from model import MercuryNet, encode_state, load_net
+from model import MercuryNet, encode_state_for, load_net
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -202,7 +202,7 @@ class InferenceBot:
             if not any(mask):
                 continue
 
-            state_enc = encode_state(gs, self.color)
+            state_enc = encode_state_for(self.net, gs, self.color)
             action    = self._select_action(state_enc, mask)
             msg_out   = build_server_message(
                 action, hand, mbc[self.color], self.color, mbc,

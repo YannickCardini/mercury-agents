@@ -7,7 +7,7 @@ Lancer :
   python bot_rl.py
 """
 
-import asyncio, json, os, pathlib, random, threading
+import asyncio, json, os, pathlib, random, shutil, threading
 import concurrent.futures, functools
 from collections import deque
 import torch
@@ -16,11 +16,13 @@ import httpx
 import websockets
 
 from mercury_legal_moves import (
-    get_legal_mask, build_server_message,
+    get_legal_mask, build_server_message, DISCARD_IDX,
     ARRIVAL_POSITIONS, HOME_POSITIONS, ALL_COLORS,
 )
 from reward  import compute_reward, terminal_reward
-from model   import MercuryNet, encode_state, load_net, ACTION_DIM, STATE_DIM
+from model   import (
+    MercuryNet, encode_state, encode_state_for, load_net, ACTION_DIM, STATE_DIM,
+)
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -170,10 +172,22 @@ class PPOAgent:
         self.recent_wins = deque(maxlen=WINRATE_WINDOW)
         # Win-rate du learner greedy vs 3 bots aléatoires : métrique absolue (thermomètre).
         self.eval_wins = deque(maxlen=EVAL_WINDOW)
+        # Diagnostic du mode d'échec vs random (fenêtre glissante, bot net uniquement) :
+        # pourquoi perd-on les ~18 % ? finies = billes en arrivée en fin de partie (0-4),
+        # captured = mes billes renvoyées au home (capturées), length = nb de mes coups,
+        # discards = mains jetées faute de coup utile.
+        self.eval_finished = deque(maxlen=EVAL_WINDOW)
+        self.eval_captured = deque(maxlen=EVAL_WINDOW)
+        self.eval_length   = deque(maxlen=EVAL_WINDOW)
+        self.eval_discards = deque(maxlen=EVAL_WINDOW)
         # Win-rate du réseau courant vs l'agent de référence (0.82 prod) en duel direct :
         # LE critère de remplacement prod. Un candidat doit dépasser DUEL_REPLACE_THRESHOLD.
         self.duel_wins = deque(maxlen=DUEL_WINDOW)
         self.best_duel = 0.0   # meilleur duel_rate vu → déclenche l'auto-save model_best.pt
+        # Filet de sécurité : meilleur win-rate vs random vu → auto-save model_best_eval.pt.
+        # La win_rate self-play (~0.25) est aveugle aux régressions absolues ; ce best
+        # capture la VRAIE meilleure politique vs random et l'empêche d'être perdue.
+        self.best_eval = 0.0
         # Réseau de référence figé pour le duel (chargé dans sa propre architecture via
         # load_net : le ref est un ancien MercuryNetLegacy 2×256).
         self.ref_net = load_net(REF_MODEL_PATH) if REF_MODEL_PATH.exists() else None
@@ -198,8 +212,22 @@ class PPOAgent:
                 self.net.load_state_dict(ckpt)
                 print(f"Modèle chargé depuis {MODEL_PATH} (ancien format state_dict brut)")
         except RuntimeError:
-            print(f"Checkpoint incompatible (STATE_DIM changé ?), repartir de zéro.")
-            MODEL_PATH.unlink()
+            # STATE_DIM a changé (passage à l'encodage 138-dim) → l'ancien checkpoint n'est
+            # plus chargeable. On met de côté les modèles déployables (au lieu de les
+            # supprimer) pour ne rien perdre, puis on repart de zéro.
+            backup = MODEL_PATH.with_name("model_legacy54_backup.pt")
+            if not backup.exists():
+                os.replace(MODEL_PATH, backup)   # déplace model.pt → backup
+                print(f"Checkpoint incompatible (nouvel encodage) → sauvegardé dans "
+                      f"{backup}. Entraînement repart de zéro.")
+            else:
+                MODEL_PATH.unlink()
+                print("Checkpoint incompatible (nouvel encodage). Entraînement repart de zéro.")
+            # Préserver aussi l'ancien model_best.pt (save_best l'écraserait dès le 1er duel).
+            best, best_bak = pathlib.Path("model_best.pt"), pathlib.Path("model_best_legacy54_backup.pt")
+            if best.exists() and not best_bak.exists():
+                shutil.copy2(best, best_bak)
+                print(f"Ancien model_best.pt sauvegardé dans {best_bak}.")
 
     def _save_snapshot(self):
         """Gèle une copie du réseau courant dans le pool et sur disque."""
@@ -244,6 +272,22 @@ class PPOAgent:
         torch.save(ckpt, tmp)
         os.replace(tmp, best_path)
         print(f"[BEST] nouveau record duel={duel_rate:.3f} → {best_path}")
+
+    def save_best_eval(self, eval_rate: float):
+        """Sauvegarde model_best_eval.pt si `eval_rate` (win-rate vs random) bat le record.
+        Filet absolu : capture la meilleure politique vs random, que la win_rate self-play
+        (toujours ~0.25) est incapable de signaler. Écriture atomique."""
+        if eval_rate <= self.best_eval:
+            return
+        self.best_eval = eval_rate
+        best_path = pathlib.Path("model_best_eval.pt")
+        ckpt = {'net': self.net.state_dict(),
+                'n_updates': self.n_updates, 'n_games': self.n_games,
+                'eval_rate': eval_rate}
+        tmp = best_path.with_suffix('.pt.tmp')
+        torch.save(ckpt, tmp)
+        os.replace(tmp, best_path)
+        print(f"[BEST-EVAL] nouveau record vs random={eval_rate:.3f} → {best_path}")
 
     def sample_opponent_net(self) -> MercuryNet:
         """Tire aléatoirement un snapshot GELÉ du pool (jamais le réseau courant).
@@ -562,7 +606,7 @@ class EvalBot:
     `agent` n'est utilisé que pour le verrou d'inférence (protège net pendant updates)."""
 
     def __init__(self, agent: PPOAgent, bot_id: str, name: str, mode: str,
-                 net=None, result_sink=None):
+                 net=None, result_sink=None, collect_stats: bool = False):
         self.agent       = agent
         self.mode        = mode          # 'random' | 'net'
         self.net         = net           # réseau à jouer si mode == 'net'
@@ -572,6 +616,14 @@ class EvalBot:
         self.color       = None
         self._over       = False
         self._won_color  = None          # couleur gagnante de la partie (lue après coup)
+        # Diagnostic du mode d'échec (bot net d'éval uniquement). Compteurs accumulés
+        # sur la partie, relus après coup par run_eval_game.
+        self.collect_stats = collect_stats
+        self.turns_played  = 0           # nb de mes coups joués
+        self.discards      = 0           # nb de mains jetées
+        self.captured      = 0           # nb de mes billes renvoyées au home (capturées)
+        self.finished      = 0           # mes billes en arrivée en fin de partie (0-4)
+        self._prev_my      = None        # mes positions au gameState précédent
 
     def _resolve_color(self, gs: dict) -> bool:
         for p in gs['players']:
@@ -593,12 +645,29 @@ class EvalBot:
         if self.mode == 'random':
             return random.choice(legal_idx)
         # Greedy : argmax de la politique du réseau fourni (cf. main.py / prod).
-        state_enc = encode_state(gs, self.color)
+        # encode_state_for route vers l'encodeur correct : le ref de duel est un modèle
+        # LEGACY (entrée 54) tandis que le réseau courant utilise l'encodage 138-dim.
+        state_enc = encode_state_for(self.net, gs, self.color)
         legal     = torch.tensor(mask, dtype=torch.bool)
         with torch.no_grad():
             with self.agent._inference_lock:  # le réseau courant peut être en cours d'update
                 dist, _ = self.net(state_enc, legal)
                 return int(torch.argmax(dist.probs).item())
+
+    def _track_captures(self, gs: dict):
+        """Capture subie = une de mes billes passe de 'en jeu' à 'home' entre deux
+        gameStates (dans ce jeu une bille ne retourne au home QUE si elle est capturée :
+        mon propre coup ne l'y renvoie jamais — promote va en arrivée, enter quitte le
+        home). Appelé sur CHAQUE gameState (les captures arrivent aux tours adverses)."""
+        my = _marbles_by_color(gs).get(self.color)
+        if my is None:
+            return
+        home = HOME_POSITIONS[self.color]
+        if self._prev_my is not None:
+            for prev_p, cur_p in zip(self._prev_my, my):
+                if prev_p not in home and cur_p in home:
+                    self.captured += 1
+        self._prev_my = list(my)
 
     def _on_end(self, winner: str | None):
         if self._over:
@@ -607,6 +676,9 @@ class EvalBot:
         self._won_color = winner
         if self.result_sink is not None:
             self.result_sink.append(1 if winner == self.color else 0)
+        if self.collect_stats and self._prev_my is not None:
+            arrival = ARRIVAL_POSITIONS[self.color]
+            self.finished = sum(1 for p in self._prev_my if p in arrival)
 
     async def run(self, ws):
         await self._join(ws)
@@ -624,6 +696,8 @@ class EvalBot:
                 gs = msg["gameState"]
                 if not self._resolve_color(gs):
                     continue
+                if self.collect_stats:
+                    self._track_captures(gs)   # sur chaque état (captures aux tours adverses)
                 winner = _detect_winner(gs)
                 if winner is not None:
                     self._on_end(winner)
@@ -644,6 +718,10 @@ class EvalBot:
                     continue
 
                 action  = self._pick_action(gs, mask)
+                if self.collect_stats:
+                    self.turns_played += 1
+                    if action == DISCARD_IDX:
+                        self.discards += 1
                 msg_out = build_server_message(
                     action, hand, my_marbles, self.color, mbc,
                     invincible_by_color=inv_by_color,
@@ -709,20 +787,54 @@ async def run_training():
     async def run_eval_game():
         """Éval isolée : 1 bot greedy (réseau courant) + 3 bots aléatoires."""
         bots = []
+        net_bot = None
         for color in COLORS:
             is_net = (color == EVAL_LEARNER_COLOR)
-            bots.append(EvalBot(
+            bot = EvalBot(
                 agent, f"eval-bot-{color}",
                 f"EVAL-{'NET' if is_net else 'RND'}-{color.capitalize()}",
                 mode=('net' if is_net else 'random'),
                 net=(agent.net if is_net else None),
                 result_sink=(agent.eval_wins if is_net else None),
-            ))
+                collect_stats=is_net,
+            )
+            if is_net:
+                net_bot = bot
+            bots.append(bot)
         await _play_isolated_game(bots)
+        # Diagnostic : n'enregistrer les stats que si la partie a bien abouti pour le net.
+        if net_bot is not None and net_bot._over:
+            agent.eval_finished.append(net_bot.finished)
+            agent.eval_captured.append(net_bot.captured)
+            agent.eval_length.append(net_bot.turns_played)
+            agent.eval_discards.append(net_bot.discards)
         if agent.eval_wins:
             rate = sum(agent.eval_wins) / len(agent.eval_wins)
+            # Filet absolu : ne déclencher le best qu'avec assez d'échantillons (évite un
+            # faux record sur une fenêtre quasi vide).
+            if len(agent.eval_wins) >= 20:
+                agent.save_best_eval(rate)
             print(f"[EVAL] vs random : win_rate={rate:.3f} "
                   f"(n={len(agent.eval_wins)}, dernière={agent.eval_wins[-1]})")
+            if agent.eval_finished:
+                avg = lambda d: sum(d) / len(d)
+                print(f"[EVAL] diag TOUTES (moy/partie n={len(agent.eval_finished)}) : "
+                      f"billes_finies={avg(agent.eval_finished):.2f}/4  "
+                      f"captures_subies={avg(agent.eval_captured):.2f}  "
+                      f"coups={avg(agent.eval_length):.1f}  "
+                      f"discards={avg(agent.eval_discards):.2f}")
+                # Détail sur les parties PERDUES : c'est là que sont les ~18 % à expliquer.
+                # Les deques sont alignées avec eval_wins (un append par partie aboutie).
+                losses = [(f, c, l, d) for w, f, c, l, d in zip(
+                            agent.eval_wins, agent.eval_finished, agent.eval_captured,
+                            agent.eval_length, agent.eval_discards) if w == 0]
+                if losses:
+                    n = len(losses)
+                    print(f"[EVAL] diag PERDUES (n={n}) : "
+                          f"billes_finies={sum(x[0] for x in losses)/n:.2f}/4  "
+                          f"captures_subies={sum(x[1] for x in losses)/n:.2f}  "
+                          f"coups={sum(x[2] for x in losses)/n:.1f}  "
+                          f"discards={sum(x[3] for x in losses)/n:.2f}")
 
     async def run_duel_game():
         """Duel isolé : 2 bots jouent le réseau COURANT (greedy), 2 jouent le ref figé,

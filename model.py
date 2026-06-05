@@ -1,7 +1,26 @@
 """
 Réseau de politique et valeur pour le bot RL Mercury.
-Architecture courante (MercuryNet) : 3 couches + LayerNorm, têtes policy/value séparées.
-Architecture historique (MercuryNetLegacy) : 2×256 ReLU — chargement des anciens modèles.
+
+ENCODAGE COURANT (138 dims) — repris de models/model_v3.py. Point clé : la main est
+encodée CARTE PAR CARTE (5 slots × 13 rangs), ce que l'ancien encodage 54-dim ne faisait
+pas (il ne donnait qu'un bitmask des rangs présents, sans ordre). Or l'espace d'action
+est indexé PAR SLOT de carte (cf. mercury_legal_moves.py) : sans connaître la carte de
+chaque slot, le réseau ne pouvait pas choisir QUELLE carte dépenser quand plusieurs
+cartes jouent le même pion. C'est la correction de fond.
+
+Le repère de position est désormais l'index d'ANNEAU PARTAGÉ (0..55 dans MAIN_PATH,
+normalisé) au lieu de pos/68 (les cases brutes vont jusqu'à 223 → valeurs > 3, non
+comparables entre couleurs).
+
+Architecture INCHANGÉE vs la version 54-dim qui convergeait : 2 couches ReLU, têtes
+directes, softmax masqué, hidden=384. On ne change QU'UN seul facteur — l'encodage
+d'entrée (54 → 138). La tentative v3 d'origine échouait parce qu'elle changeait AUSSI
+l'architecture (3 couches + LayerNorm) en même temps : impossible d'isoler la cause.
+
+ENCODAGE LEGACY (54 dims, encode_state_legacy) + MercuryNetLegacy 2×256 : conservés
+UNIQUEMENT pour charger/jouer les anciens modèles (ex. model_ref_082.pt, l'agent 0.82
+en prod) comme adversaire de duel. encode_state_for() route chaque réseau vers le bon
+encodeur selon la largeur de son entrée.
 """
 
 import torch
@@ -10,111 +29,209 @@ import torch.nn.functional as F
 from torch.distributions import Categorical
 
 from mercury_legal_moves import (
-    MAIN_PATH, HOME_POSITIONS, START_POSITIONS, ARRIVAL_POSITIONS,
-    _MAIN_PATH_IDX, _MAIN_PATH_LEN, _ALL_STARTS, ALL_COLORS,
+    HOME_POSITIONS, START_POSITIONS, ARRIVAL_POSITIONS,
+    _MAIN_PATH_IDX, _MAIN_PATH_LEN, ALL_COLORS,
 )
 
 # ── Constantes d'espace ───────────────────────────────────────────────────────
 
-STATE_DIM  = 54   # encodage compact de l'état du jeu (sans zéros parasites)
-ACTION_DIM = 501  # nombre d'actions (cartes × cibles ou split-7)
+STATE_DIM        = 138   # encodage courant (main par slot + anneau partagé + flags)
+STATE_DIM_LEGACY = 54    # ancien encodage (bitmask de rangs) — anciens modèles seulement
+ACTION_DIM       = 501   # nombre d'actions (cartes × cibles ou split-7)
+
+# Ordre des rangs pour l'encodage de la main (one-hot par slot).
+_CARD_VALUES = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
+_CARD_IDX    = {v: i for i, v in enumerate(_CARD_VALUES)}
+
+_DANGER_RANGE = 12   # bille adverse à ≤ 12 cases derrière (≙ Q) = menace de capture
 
 
-# ── Encodage d'état ───────────────────────────────────────────────────────────
+# ── Helpers d'encodage par bille ──────────────────────────────────────────────
 
-def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
-    """
-    Encode l'état du jeu en vecteur de STATE_DIM dimensions.
-
-    Structure (54 dims) :
-      [0:4]   → positions de mes 4 billes (normalisé 0–68)
-      [4:16]  → positions des 12 billes adverses (3 couleurs × 4)
-      [16:20] → progression normalisée de mes 4 billes vers l'arrivée (0→1)
-      [20:32] → progression des 12 billes adverses (3 couleurs × 4)
-      [32:36] → nombre de billes arrivées par couleur (4 couleurs, normalisé /4)
-      [36:40] → tour actuel (one-hot sur 4 couleurs)
-      [40:53] → main : présence de chaque rang (2..A), one-hot 13 dims
-      [53]    → canDiscard (float 0/1)
-    """
-    feat = torch.zeros(STATE_DIM, dtype=torch.float32)
-
-    # Récupérer les positions des billes
-    marbles_by_color = {}
-    for player in game_state['players']:
-        marbles_by_color[player['color']] = player['marblePositions']
-
-    # [0:4] Mes billes
-    my_marbles = marbles_by_color.get(my_color, [0, 0, 0, 0])
-    for i, pos in enumerate(my_marbles):
-        feat[i] = pos / 68.0
-
-    # [4:16] Billes adverses (3 couleurs × 4 = 12)
-    idx = 4
-    for color in ALL_COLORS:
-        if color != my_color:
-            opp_marbles = marbles_by_color.get(color, [0, 0, 0, 0])
-            for pos in opp_marbles:
-                feat[idx] = pos / 68.0
-                idx += 1
-
-    # [16:20] Progression normalisée de mes 4 billes
-    for i, pos in enumerate(my_marbles):
-        feat[16 + i] = _marble_progress_norm(pos, my_color)
-
-    # [20:32] Progression des billes adverses (3 couleurs × 4 = 12)
-    idx = 20
-    for color in ALL_COLORS:
-        if color != my_color:
-            opp_marbles = marbles_by_color.get(color, [0, 0, 0, 0])
-            for pos in opp_marbles:
-                feat[idx] = _marble_progress_norm(pos, color)
-                idx += 1
-
-    # [32:36] Billes arrivées par couleur (4 couleurs)
-    for i, color in enumerate(ALL_COLORS):
-        arrival = ARRIVAL_POSITIONS[color]
-        marbles = marbles_by_color.get(color, [])
-        n_arrived = sum(1 for p in marbles if p in arrival)
-        feat[32 + i] = n_arrived / 4.0
-
-    # [36:40] Tour actuel (one-hot)
-    current_turn = game_state.get('currentTurn', my_color)
-    turn_idx = ALL_COLORS.index(current_turn)
-    feat[36 + turn_idx] = 1.0
-
-    # [40:53] Main du joueur (13 rangs 2..A, one-hot)
-    hand = game_state.get('hand', [])
-    hand_values = set()
-    for card in hand:
-        if isinstance(card, dict):
-            hand_values.add(card.get('value', ''))
-        else:
-            hand_values.add(str(card))
-
-    card_names = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
-    for card_idx, card_name in enumerate(card_names):
-        feat[40 + card_idx] = 1.0 if card_name in hand_values else 0.0
-
-    # [53] canDiscard
-    feat[53] = 1.0 if game_state.get('canDiscard', False) else 0.0
-
-    return feat
+def _marble_abs_enc(pos: int, color: str) -> float:
+    """Index absolu dans MAIN_PATH normalisé (repère d'ANNEAU PARTAGÉ par toutes les
+    couleurs) : HOME=0, chemin 1..56, arrivée 57..60 — le tout /61. Permet au réseau de
+    comparer physiquement les positions (qui peut capturer qui)."""
+    if pos in HOME_POSITIONS[color]:
+        return 0.0
+    arrival = ARRIVAL_POSITIONS[color]
+    if pos in arrival:
+        return (57 + arrival.index(pos)) / 61.0
+    if pos in _MAIN_PATH_IDX:
+        return (_MAIN_PATH_IDX[pos] + 1) / 61.0
+    return 0.0
 
 
 def _marble_progress_norm(pos: int, color: str) -> float:
-    """Progrès normalisé (0–1) d'une bille vers la victoire."""
+    """Progrès normalisé (0–1) d'une bille vers la victoire, RELATIF au start de sa
+    couleur (à quel point cette bille est avancée pour SON camp).
+      0.0  = en HOME            0.05 = vient d'entrer (case start)
+      0.70 = tour complet fait  0.775..1.0 = zone d'arrivée slot 0→3
+    """
     if pos in HOME_POSITIONS[color]:
         return 0.0
     arrival = ARRIVAL_POSITIONS[color]
     if pos in arrival:
         i = arrival.index(pos)
-        return (0.775 + i * 0.075) / 1.0  # 0.775, 0.85, 0.925, 1.0
+        return 0.775 + i * 0.075            # 0.775, 0.85, 0.925, 1.0
     if pos in _MAIN_PATH_IDX:
         start_idx = _MAIN_PATH_IDX[START_POSITIONS[color]]
         pos_idx   = _MAIN_PATH_IDX[pos]
         steps     = (pos_idx - start_idx) % _MAIN_PATH_LEN
-        return (0.05 + steps / _MAIN_PATH_LEN * 0.65) / 1.0  # 0.05 → 0.70
+        return 0.05 + steps / _MAIN_PATH_LEN * 0.65   # 0.05 → 0.70
     return 0.0
+
+
+def _marble_safe(pos: int, color: str) -> float:
+    """1.0 si la bille est sur sa propre case de départ (invulnérable)."""
+    return 1.0 if pos == START_POSITIONS[color] else 0.0
+
+
+def _marble_danger(pos: int, color: str, marbles_by_color: dict) -> float:
+    """1.0 si une bille adverse est à ≤ _DANGER_RANGE cases derrière, sur le main path
+    (menace de capture — signal utile pour le Valet défensif et le recul au 4)."""
+    if pos not in _MAIN_PATH_IDX or pos == START_POSITIONS[color]:
+        return 0.0
+    my_idx = _MAIN_PATH_IDX[pos]
+    for opp_color, positions in marbles_by_color.items():
+        if opp_color == color:
+            continue
+        for opp_pos in positions:
+            if opp_pos in _MAIN_PATH_IDX:
+                dist_behind = (my_idx - _MAIN_PATH_IDX[opp_pos]) % _MAIN_PATH_LEN
+                if 1 <= dist_behind <= _DANGER_RANGE:
+                    return 1.0
+    return 0.0
+
+
+# ── Encodage d'état COURANT (138 dims) ─────────────────────────────────────────
+
+def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
+    """Encode l'état du jeu en vecteur de STATE_DIM (138) dimensions.
+
+    Structure :
+      [0:16]    position absolue (anneau partagé) des 16 billes — ma couleur d'abord
+      [16:32]   progrès relatif (0→1) des 16 billes vers l'arrivée de leur camp
+      [32:48]   flag protégé (sur sa case start) des 16 billes
+      [48:113]  main : 5 slots × 13 rangs one-hot   ← LA correction clé
+      [113]     canDiscard
+      [114:130] flag danger des 16 billes (adversaire ≤ 12 cases derrière)
+      [130:134] fraction de billes en jeu (hors home) par couleur (ma couleur d'abord)
+      [134:138] fraction de billes en zone d'arrivée par couleur
+    """
+    vec: list[float] = []
+    color_order      = [my_color] + [c for c in ALL_COLORS if c != my_color]
+    marbles_by_color = {p['color']: p['marblePositions'] for p in game_state['players']}
+
+    def marbles(color: str) -> list[int]:
+        return marbles_by_color.get(color, [0, 0, 0, 0])
+
+    # [0:16] position absolue (anneau partagé)
+    for color in color_order:
+        for pos in marbles(color):
+            vec.append(_marble_abs_enc(pos, color))
+
+    # [16:32] progrès relatif au camp
+    for color in color_order:
+        for pos in marbles(color):
+            vec.append(_marble_progress_norm(pos, color))
+
+    # [32:48] flag protégé (case start)
+    for color in color_order:
+        for pos in marbles(color):
+            vec.append(_marble_safe(pos, color))
+
+    # [48:113] main : 5 slots × 13 rangs one-hot (padding zéros si < 5 cartes)
+    hand = game_state.get('hand', [])
+    for i in range(5):
+        slot = [0.0] * 13
+        if i < len(hand):
+            card  = hand[i]
+            value = card.get('value') if isinstance(card, dict) else str(card)
+            ci    = _CARD_IDX.get(value)
+            if ci is not None:
+                slot[ci] = 1.0
+        vec.extend(slot)
+
+    # [113] canDiscard
+    vec.append(1.0 if game_state.get('canDiscard', False) else 0.0)
+
+    # [114:130] flag danger
+    for color in color_order:
+        for pos in marbles(color):
+            vec.append(_marble_danger(pos, color, marbles_by_color))
+
+    # [130:134] fraction de billes en jeu (hors home) par couleur
+    for color in color_order:
+        ms = marbles(color)
+        vec.append(sum(1 for p in ms if p not in HOME_POSITIONS[color]) / 4.0)
+
+    # [134:138] fraction de billes en zone d'arrivée par couleur
+    for color in color_order:
+        ms = marbles(color)
+        vec.append(sum(1 for p in ms if p in ARRIVAL_POSITIONS[color]) / 4.0)
+
+    return torch.tensor(vec, dtype=torch.float32)
+
+
+# ── Encodage d'état LEGACY (54 dims) ──────────────────────────────────────────
+# Conservé pour les modèles entraînés sur l'ancien encodage (ex. model_ref_082.pt joué
+# comme adversaire de duel). NE PAS utiliser pour entraîner le réseau courant.
+
+def encode_state_legacy(game_state: dict, my_color: str) -> torch.Tensor:
+    """ANCIEN encodage 54-dim (bitmask de rangs, positions /68, sans info par slot)."""
+    feat = torch.zeros(STATE_DIM_LEGACY, dtype=torch.float32)
+
+    marbles_by_color = {p['color']: p['marblePositions'] for p in game_state['players']}
+
+    my_marbles = marbles_by_color.get(my_color, [0, 0, 0, 0])
+    for i, pos in enumerate(my_marbles):
+        feat[i] = pos / 68.0
+
+    idx = 4
+    for color in ALL_COLORS:
+        if color != my_color:
+            for pos in marbles_by_color.get(color, [0, 0, 0, 0]):
+                feat[idx] = pos / 68.0
+                idx += 1
+
+    for i, pos in enumerate(my_marbles):
+        feat[16 + i] = _marble_progress_norm(pos, my_color)
+
+    idx = 20
+    for color in ALL_COLORS:
+        if color != my_color:
+            for pos in marbles_by_color.get(color, [0, 0, 0, 0]):
+                feat[idx] = _marble_progress_norm(pos, color)
+                idx += 1
+
+    for i, color in enumerate(ALL_COLORS):
+        arrival = ARRIVAL_POSITIONS[color]
+        ms      = marbles_by_color.get(color, [])
+        feat[32 + i] = sum(1 for p in ms if p in arrival) / 4.0
+
+    current_turn = game_state.get('currentTurn', my_color)
+    feat[36 + ALL_COLORS.index(current_turn)] = 1.0
+
+    hand        = game_state.get('hand', [])
+    hand_values = set()
+    for card in hand:
+        hand_values.add(card.get('value', '') if isinstance(card, dict) else str(card))
+    card_names = ['2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
+    for ci, name in enumerate(card_names):
+        feat[40 + ci] = 1.0 if name in hand_values else 0.0
+
+    feat[53] = 1.0 if game_state.get('canDiscard', False) else 0.0
+    return feat
+
+
+def encode_state_for(net: nn.Module, game_state: dict, my_color: str) -> torch.Tensor:
+    """Route vers le bon encodeur selon la largeur d'entrée du réseau :
+      - entrée 54  → encode_state_legacy (anciens modèles, ex. ref 0.82)
+      - sinon (138) → encode_state (encodage courant)."""
+    if net.fc1.in_features == STATE_DIM_LEGACY:
+        return encode_state_legacy(game_state, my_color)
+    return encode_state(game_state, my_color)
 
 
 # ── Réseau de politique-valeur ────────────────────────────────────────────────
@@ -128,13 +245,9 @@ def _apply_mask_dist(logits: torch.Tensor, legal_mask: torch.Tensor) -> Categori
 
 class MercuryNet(nn.Module):
     """
-    Réseau PPO : politique + valeur.
-    Architecture IDENTIQUE au legacy (2 couches, ReLU nu, têtes directes) — c'est la
-    config prouvée qui converge (eval 0.82). SEUL changement isolé : hidden_dim 256→384.
-    On teste UN facteur à la fois : la tentative précédente (3 couches + LayerNorm +
-    têtes séparées, tout d'un coup) bloquait l'apprentissage (entropie ~2.0). Si 384
-    converge, on ajoutera le facteur suivant ensuite.
-    Encodage d'entrée inchangé (STATE_DIM=54, le meilleur connu).
+    Réseau PPO : politique + valeur. Entrée = encodage COURANT (STATE_DIM=138).
+    Architecture identique à la version 54-dim qui convergeait (2 couches, ReLU nu,
+    têtes directes, softmax masqué) — SEUL l'encodage d'entrée change (54 → 138).
     """
 
     def __init__(self, hidden_dim: int = 384):
@@ -160,14 +273,14 @@ class MercuryNet(nn.Module):
 
 
 class MercuryNetLegacy(nn.Module):
-    """Architecture HISTORIQUE (2×256, ReLU nu) — conservée UNIQUEMENT pour charger
-    les anciens checkpoints (ex. model_ref_082.pt, l'agent 0.82 en prod) comme
-    adversaire de duel. Ne sert plus à l'entraînement."""
+    """Architecture HISTORIQUE (2×256, ReLU nu) + entrée LEGACY (STATE_DIM_LEGACY=54).
+    Conservée UNIQUEMENT pour charger les anciens checkpoints (ex. model_ref_082.pt,
+    l'agent 0.82 en prod) comme adversaire de duel. Ne sert plus à l'entraînement."""
 
     def __init__(self, hidden_dim: int = 256):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.fc1 = nn.Linear(STATE_DIM, hidden_dim)
+        self.fc1 = nn.Linear(STATE_DIM_LEGACY, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
         self.policy_head = nn.Linear(hidden_dim, ACTION_DIM)
         self.value_head  = nn.Linear(hidden_dim, 1)
@@ -190,15 +303,14 @@ class MercuryNetLegacy(nn.Module):
 
 def load_net(path, map_location="cpu", eval_mode: bool = True) -> nn.Module:
     """Charge un checkpoint (dict {net,...} ou state_dict brut) dans la BONNE
-    architecture, auto-détectée par la LARGEUR du backbone (`fc1.weight` → hidden_dim) :
-      - hidden_dim == 256 → MercuryNetLegacy (anciens modèles, ex. model_ref_082.pt)
-      - sinon              → MercuryNet (largeur courante, ex. 384)
-    MercuryNet et MercuryNetLegacy partagent désormais la même STRUCTURE (2 couches,
-    têtes directes) ; seule la largeur les distingue. Renvoie le réseau prêt (eval)."""
-    ckpt  = torch.load(path, weights_only=True, map_location=map_location)
-    state = ckpt['net'] if isinstance(ckpt, dict) and 'net' in ckpt else ckpt
-    hidden = state['fc1.weight'].shape[0]
-    net = MercuryNetLegacy(hidden) if hidden == 256 else MercuryNet(hidden)
+    architecture, auto-détectée par la LARGEUR D'ENTRÉE (`fc1.weight` → in_features) :
+      - in_features == 54 → MercuryNetLegacy (anciens modèles, encodage legacy)
+      - sinon (138)        → MercuryNet (encodage courant)
+    La largeur cachée (256/384) est lue depuis le checkpoint. Renvoie le réseau prêt."""
+    ckpt   = torch.load(path, weights_only=True, map_location=map_location)
+    state  = ckpt['net'] if isinstance(ckpt, dict) and 'net' in ckpt else ckpt
+    hidden, in_features = state['fc1.weight'].shape
+    net = MercuryNetLegacy(hidden) if in_features == STATE_DIM_LEGACY else MercuryNet(hidden)
     net.load_state_dict(state)
     if eval_mode:
         net.eval()

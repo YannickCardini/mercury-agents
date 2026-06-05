@@ -23,6 +23,14 @@ OPP_ARRIVAL_PENALTY  = 0.015 # malus fixe par bille adverse entrant en zone d'ar
 OPP_ARRIVAL_SCALE    = 0.01  # malus additionnel par bille déjà arrivée chez l'adversaire
 THREAT_PENALTY       = 0.005 # malus si une bille à moi est à portée d'un adversaire
 THREAT_RANGE         = 6     # distance (en cases) considérée comme menaçante — INCHANGÉ
+# Capture subie (bille renvoyée au home) : le mode d'échec #1 diagnostiqué (~20/partie !).
+# Avant, une bille capturée à mi-parcours ne coûtait que Δprogress×OWN_PROGRESS_COEF (~0.03)
+# → le bot n'apprenait jamais à protéger ses billes (parties de ~200 coups, win vs random
+# qui régressait de 0.82 à 0.62). On rend la capture coûteuse, proportionnellement au
+# progrès perdu. Asymétrie VOULUE : se protéger (≈ −0.25) pèse plus que capturer un
+# adversaire (+OPP_PROGRESS_COEF×progrès) — sa propre progression vaut plus que de gêner.
+CAPTURE_PENALTY      = 0.10  # malus fixe : se faire renvoyer au home est mauvais en soi
+CAPTURE_LOSS_COEF    = 0.20  # + proportionnel au progrès perdu (bille avancée = pire)
 # Bonus d'entrée : faire entrer une bille est rare et débloquant (sans bille en jeu on
 # passe son tour). Reste largement au-dessus de "advance-1" (≈0.0017 à cette échelle).
 ENTRY_BONUS          = 0.1
@@ -109,6 +117,11 @@ def compute_reward(prev_gs: dict, curr_gs: dict, my_color: str) -> float:
     for prev_p, curr_p in zip(prev_mine, curr_mine):
         delta = marble_progress(curr_p, my_color) - marble_progress(prev_p, my_color)
         reward += delta * OWN_PROGRESS_COEF
+        # Capture subie : ma bille passe du plateau au home. Impossible par mon propre coup
+        # (promote → arrivée, enter quitte le home) → c'est forcément une capture adverse.
+        # Pénalité fixe + proportionnelle au progrès perdu (le mode d'échec #1 diagnostiqué).
+        if prev_p not in HOME_POSITIONS[my_color] and curr_p in HOME_POSITIONS[my_color]:
+            reward -= CAPTURE_PENALTY + marble_progress(prev_p, my_color) * CAPTURE_LOSS_COEF
         # Bonus d'entrée : sans cela le signal immédiat pour "enter" (≈0.075)
         # ne domine pas "advance-1" (≈0.017) malgré la valeur stratégique réelle.
         if prev_p in HOME_POSITIONS[my_color] and curr_p not in HOME_POSITIONS[my_color]:

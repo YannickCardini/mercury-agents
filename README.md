@@ -83,28 +83,30 @@ Après entraînement, copier le meilleur snapshot en `model.pt` et pousser sur `
 
 ### `model.py` — Réseau de neurones
 
-**Encodage de l'état (54 dimensions) :**
+**Encodage de l'état (138 dimensions) :**
 
-Le plateau est une grille dont seules **68 cases** sont actives pour le déplacement, plus **8 cases par couleur** (4 HOME + 4 ARRIVAL). La normalisation des positions brutes utilise donc `/68.0`.
+Le plateau est une grille 15×15 (cases 0–224) dont seules **56 cases** forment l'anneau de jeu (`MAIN_PATH`), plus **8 cases par couleur** (4 HOME + 4 ARRIVAL). Les positions brutes ne sont donc pas comparables telles quelles : on encode chaque bille par son **index d'anneau partagé** (0–55, normalisé /61), repère commun à toutes les couleurs.
 
-| Features          | Dimensions | Contenu                                                    |
-|-------------------|------------|------------------------------------------------------------|
-| Positions propres | [0:4]      | 4 marbles du bot (normalisé /68)                           |
-| Positions adv.    | [4:16]     | 12 marbles adversaires (3 couleurs × 4, normalisé /68)     |
-| Progression own   | [16:20]    | Progrès normalisé (0→1) de mes 4 marbles vers l'arrivée    |
-| Progression adv.  | [20:32]    | Progrès normalisé des 12 marbles adverses (3 couleurs × 4) |
-| Arrivées          | [32:36]    | Marbles arrivées par couleur (4 couleurs, normalisé /4)    |
-| Tour actuel       | [36:40]    | One-hot encoding (4 couleurs)                              |
-| Cartes en main    | [40:53]    | Présence de chaque rang (2..A), one-hot 13 dims             |
-| canDiscard        | [53]       | Flag booléen                                               |
+> **Correction clé (vs l'ancien encodage 54-dim) :** la main est encodée **carte par carte** (5 slots × 13 rangs), pas comme un simple bitmask de rangs présents. L'espace d'action étant indexé **par slot de carte**, le réseau doit savoir *quelle carte occupe quel slot* pour choisir laquelle dépenser — sinon il joue le bon pion mais gâche ses cartes. L'ancien encodeur reste dans `encode_state_legacy` pour rejouer les modèles d'avant (ex. ref 0.82) en duel.
+
+| Features              | Dimensions  | Contenu                                                       |
+|-----------------------|-------------|--------------------------------------------------------------|
+| Position absolue      | [0:16]      | 16 billes (ma couleur d'abord), index d'anneau MAIN_PATH /61 |
+| Progrès relatif       | [16:32]     | Progrès 0→1 des 16 billes vers l'arrivée de leur camp        |
+| Flag protégé          | [32:48]     | 1 si la bille est sur sa case start (invulnérable)           |
+| **Main (par slot)**   | [48:113]    | **5 slots × 13 rangs one-hot — quelle carte dans quel slot** |
+| canDiscard            | [113]       | Flag booléen                                                 |
+| Flag danger           | [114:130]   | 1 si un adversaire est à ≤ 12 cases derrière la bille        |
+| Fraction en jeu       | [130:134]   | Billes hors home par couleur (normalisé /4)                  |
+| Fraction en arrivée   | [134:138]   | Billes en zone d'arrivée par couleur (normalisé /4)          |
 
 **Architecture du réseau :**
 ```
-Entrée (54) → FC(256, ReLU) → FC(256, ReLU) → Policy head (501 actions)
-                                             → Value head (1 scalaire)
+Entrée (138) → FC(384, ReLU) → FC(384, ReLU) → Policy head (501 actions)
+                                              → Value head (1 scalaire)
 ```
 - Les actions illégales sont masquées (`-inf` dans le softmax) avant l'échantillonnage
-- Total : ~209 000 paramètres
+- Architecture volontairement **identique** à la version 54-dim qui convergeait : on n'a changé **qu'un seul facteur**, l'encodage d'entrée (54 → 138), pour en isoler l'effet
 
 ---
 
