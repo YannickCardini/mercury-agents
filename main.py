@@ -45,7 +45,7 @@ LISTEN_HOST = os.environ.get("MERCURY_AGENT_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("MERCURY_AGENT_PORT", os.environ.get("PORT", "8000")))
 
 # Délais simulés pour imiter un joueur humain (secondes)
-THINK_MIN = float(os.environ.get("MERCURY_THINK_MIN", "1.0"))
+THINK_MIN = float(os.environ.get("MERCURY_THINK_MIN", "0.5"))
 THINK_MAX = float(os.environ.get("MERCURY_THINK_MAX", "8.5"))
 
 # Identités des bots. Les comptes correspondants existent déjà en base ;
@@ -140,6 +140,27 @@ class InferenceBot:
             "picture":    self.picture,
         }))
 
+    async def _maybe_react(self, ws, action: dict) -> None:
+        atype = action.get("type")
+        actor = action.get("playerColor")
+
+        emoji = None
+        if atype == "capture" and actor != self.color and random.random() < 1 / 15:
+            emoji = "😡"
+        elif atype == "promote" and actor == self.color and random.random() < 1 / 30:
+            emoji = "😎"
+        elif atype == "capture" and actor == self.color and random.random() < 1 / 15:
+            emoji = "🔥"
+        elif atype == "enter" and actor == self.color and random.random() < 1 / 20:
+            emoji = "👏"
+
+        if emoji:
+            await ws.send(json.dumps({
+                "type":      "reaction",
+                "emoji":     emoji,
+                "fromColor": self.color,
+            }))
+
     async def play_one_game(self, ws) -> None:
         await self._join(ws)
         anim_done = json.dumps({"type": "animationDone"})
@@ -150,6 +171,8 @@ class InferenceBot:
 
             if mtype == "actionPlayed":
                 await ws.send(anim_done)
+                if self.color:
+                    await self._maybe_react(ws, msg.get("action", {}))
                 continue
 
             if mtype == "gameEnded":
@@ -185,7 +208,10 @@ class InferenceBot:
                 action, hand, mbc[self.color], self.color, mbc,
                 invincible_by_color=inv_by_color,
             )
-            await asyncio.sleep(random.uniform(THINK_MIN, THINK_MAX))
+            # Exponential distribution clipped to [THINK_MIN, THINK_MAX]: small delays are common, large ones rare
+            lam = 3.0 / (THINK_MAX - THINK_MIN)
+            delay = THINK_MIN + min(random.expovariate(lam), THINK_MAX - THINK_MIN)
+            await asyncio.sleep(delay)
             await ws.send(json.dumps(msg_out))
 
 
