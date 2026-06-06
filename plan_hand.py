@@ -18,10 +18,16 @@ from mercury_legal_moves import (
     get_legal_mask, ARRIVAL_POSITIONS, START_POSITIONS, HOME_POSITIONS,
     _MAIN_PATH_IDX, _MAIN_PATH_LEN, PER_SLOT, DISCARD_IDX,
 )
+import time
+
 from reward import marble_progress
 
 BEAM_WIDTH   = 48    # plans gardés à chaque profondeur (élargi 24→48 : recherche + fine)
 THREAT_RANGE = 7     # bille adverse à ≤ N cases derrière = menace de capture
+# Budget de temps DUR : en prod le planificateur (Python pur) bloque la boucle asyncio
+# partagée par tous les bots. On borne la recherche pour ne jamais geler la boucle trop
+# longtemps. Au pire on renvoie le meilleur plan trouvé jusque-là (≥ un plan à 1 coup).
+MAX_PLAN_SECONDS = 0.08
 
 # Poids du score d'un état de fin de plan (objectifs « humains »).
 W_PROGRESS = 100.0   # somme des progrès de mes billes
@@ -172,9 +178,14 @@ def _search(game_state: dict, color: str, mask: list, actions: list,
     frontier = sorted(beam, key=lambda n: n['score'], reverse=True)[:BEAM_WIDTH]
 
     # ── Approfondissement : on consomme la main restante carte par carte ──
-    while frontier:
+    deadline  = time.monotonic() + MAX_PLAN_SECONDS
+    timed_out = False
+    while frontier and not timed_out:
         nxt = []
         for node in frontier:
+            if time.monotonic() > deadline:   # budget vérifié PAR nœud → blocage borné serré
+                timed_out = True
+                break
             if not node['hand']:
                 continue
             mbc = {color: node['my'], **node['opp']}

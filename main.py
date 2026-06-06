@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 import random
+import time
 
 import httpx
 import torch
@@ -220,19 +221,29 @@ class InferenceBot:
             if not any(mask):
                 continue
 
-            if AGENT_MODE == "plan":
-                action = plan_hand_pick(gs, self.color, mask, actions)
-            else:
-                state_enc = encode_state_for(self.net, gs, self.color)
-                action    = self._select_action(state_enc, mask)
+            # Sélection robuste : un plantage du sélecteur NE DOIT PAS déconnecter le bot
+            # (sinon il quitte la partie). En cas d'erreur → 1er coup légal de repli.
+            t0 = time.monotonic()
+            try:
+                if AGENT_MODE == "plan":
+                    action = plan_hand_pick(gs, self.color, mask, actions)
+                else:
+                    state_enc = encode_state_for(self.net, gs, self.color)
+                    action    = self._select_action(state_enc, mask)
+            except Exception as e:
+                print(f"[{self.name}] erreur sélection ({e!r}) → coup légal de repli", flush=True)
+                action = next(i for i, ok in enumerate(mask) if ok)
             msg_out   = build_server_message(
                 action, hand, mbc[self.color], self.color, mbc,
                 invincible_by_color=inv_by_color,
             )
             # Exponential distribution clipped to [THINK_MIN, THINK_MAX]: small delays are common, large ones rare
             lam = 3.0 / (THINK_MAX - THINK_MIN)
-            delay = THINK_MIN + min(random.expovariate(lam), THINK_MAX - THINK_MIN)
-            await asyncio.sleep(delay)
+            target = THINK_MIN + min(random.expovariate(lam), THINK_MAX - THINK_MIN)
+            # Le temps de CALCUL fait partie du "temps de réflexion" : on l'absorbe dans le
+            # délai (avant, calcul + delay s'additionnaient → risque de dépasser le timeout
+            # serveur). On dort le reste seulement.
+            await asyncio.sleep(max(0.0, target - (time.monotonic() - t0)))
             await ws.send(json.dumps(msg_out))
 
 
