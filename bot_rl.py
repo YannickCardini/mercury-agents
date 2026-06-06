@@ -23,6 +23,8 @@ from reward  import compute_reward, terminal_reward
 from model   import (
     MercuryNet, encode_state, encode_state_for, load_net, ACTION_DIM, STATE_DIM,
 )
+from heuristic_bot import heuristic_pick
+from plan_hand     import plan_hand_pick
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -51,6 +53,10 @@ SNAPSHOT_EVERY = 25   # snapshot tous les N updates (espacé 10→25 : couvre un
 WINRATE_WINDOW = 200  # fenêtre glissante pour la win-rate des bots learner
 LEARNER_PROB   = 0.6  # proba qu'un bot joue le réseau courant (→ learner) par partie
                       # ⇒ ~2-3 des 4 bots alimentent le gradient ; le reste = pool gelé
+# Parmi les bots NON-learner, proba de jouer le bot HEURISTIQUE scripté au lieu d'un
+# snapshot du pool. Apporte un adversaire cohérent (≠ self-play) → robustesse + ancre
+# anti-dérive. ~0.08/bot ⇒ ~0.3 heuristique/partie (1 seul ⇒ pas de gridlock).
+HEUR_OPPONENT_PROB = 0.2
 
 # ── Évaluation vs bots aléatoires ───────────────────────────────────────────────
 # Le win_rate vs pool tend mécaniquement vers 0.25 en self-play symétrique (on joue
@@ -62,12 +68,35 @@ EVAL_EVERY        = 10   # lancer une partie d'éval tous les N updates PPO
 EVAL_WINDOW       = 50   # fenêtre glissante de l'eval win-rate
 EVAL_LEARNER_COLOR = ALL_COLORS[0]  # couleur du bot greedy dans le quatuor d'éval
 
+# ── Évaluation vs bot HEURISTIQUE (adversaire cohérent) ─────────────────────────
+# vs random est devenu un simple plancher (il a fini son rôle : trouver le bug de
+# capture). Le vrai juge — celui qui corrèle avec le niveau humain — est le win-rate
+# d'1 net greedy contre 3 bots heuristiques (jeu cohérent, cf. heuristic_bot.py).
+HEUR_EVERY = 10   # lancer une partie net vs 3 heuristiques tous les N updates PPO
+
+# Plafond de coups d'une partie d'éval : au-delà, on l'abandonne (comptée comme défaite).
+# Évite les parties dégénérées qui tournent en rond (gridlock) et bloquent l'isolated_lock /
+# saturent le serveur. Une partie normale fait ~150-190 coups → 400 laisse de la marge.
+# Une partie à 4 joueurs COMPÉTENTS est longue (interférence/captures mutuelles) : ~400-600
+# coups, vs ~177 contre du random. 700 ne coupe donc que le vrai gridlock, pas une partie
+# normalement longue. S'applique à TOUS les bots d'éval (sinon un bot non plafonné dans une
+# partie gridlockée bloque l'isolated_lock à vie).
+EVAL_MOVE_CAP = 700
+# Sécurité ultime : si une partie isolée traîne au-delà de ça (s), on l'abandonne et on
+# libère le verrou (évite tout deadlock résiduel, ex. WS qui stalle sans coup joué).
+ISOLATED_GAME_TIMEOUT = 300
+# Plafond de coups d'une partie d'ENTRAÎNEMENT : au-delà, le bot abandonne (sans polluer
+# le buffer) et ferme la WS. ~150-300 coups/bot normal → 800 ne coupe que le gridlock.
+TRAIN_MOVE_CAP = 800
+
 # ── Duel vs l'agent de référence (la version 0.82 en prod) ──────────────────────
 # Métrique du VRAI critère : un candidat ne remplace la prod que s'il bat le ref en
 # duel direct. Partie isolée : 2 bots jouent le réseau courant, 2 jouent le ref figé
 # (positions en diagonale). On mesure la win-rate du réseau courant.
 REF_MODEL_PATH = pathlib.Path("model_ref_082.pt")  # référence figée (agent 0.82 prod)
 DUEL_EVERY     = 20   # lancer un duel tous les N updates PPO
+PLAN_DUEL_EVERY = 20  # duel planificateur-de-main vs réseau réactif (mesure : planifier
+                      # bat-il jouer au coup par coup ?). 0.50 = égalité, > 0.50 = le plan gagne.
 DUEL_WINDOW    = 50   # fenêtre glissante de la win-rate de duel
 DUEL_REPLACE_THRESHOLD = 0.55  # seuil de supériorité pour considérer un remplacement prod
 # Couleurs jouées par le réseau COURANT dans le duel (les 2 autres jouent le ref).
@@ -180,10 +209,23 @@ class PPOAgent:
         self.eval_captured = deque(maxlen=EVAL_WINDOW)
         self.eval_length   = deque(maxlen=EVAL_WINDOW)
         self.eval_discards = deque(maxlen=EVAL_WINDOW)
+        # Métrique COHÉRENTE (le vrai juge) : net greedy vs 3 heuristiques. Mêmes diagnostics.
+        self.heur_wins     = deque(maxlen=EVAL_WINDOW)
+        self.heur_finished = deque(maxlen=EVAL_WINDOW)
+        self.heur_captured = deque(maxlen=EVAL_WINDOW)
+        self.heur_length   = deque(maxlen=EVAL_WINDOW)
+        self.heur_discards = deque(maxlen=EVAL_WINDOW)
+        self.best_heur     = 0.0   # meilleur win-rate vs heuristique → auto-save
         # Win-rate du réseau courant vs l'agent de référence (0.82 prod) en duel direct :
         # LE critère de remplacement prod. Un candidat doit dépasser DUEL_REPLACE_THRESHOLD.
         self.duel_wins = deque(maxlen=DUEL_WINDOW)
         self.best_duel = 0.0   # meilleur duel_rate vu → déclenche l'auto-save model_best.pt
+        # Win-rate du PLANIFICATEUR DE MAIN vs le réseau réactif (2 vs 2). Mesure si la
+        # planification multi-cartes bat le choix au coup par coup. 0.50 = égalité.
+        self.plan_wins = deque(maxlen=DUEL_WINDOW)
+        # Niveau ABSOLU du planificateur : vs 3 random (à comparer au 0.83 du réseau et au
+        # ~0.999 d'un humain). C'est la jauge qui dit si on s'approche du niveau humain.
+        self.plan_rnd_wins = deque(maxlen=EVAL_WINDOW)
         # Filet de sécurité : meilleur win-rate vs random vu → auto-save model_best_eval.pt.
         # La win_rate self-play (~0.25) est aveugle aux régressions absolues ; ce best
         # capture la VRAIE meilleure politique vs random et l'empêche d'être perdue.
@@ -194,6 +236,26 @@ class PPOAgent:
         if self.ref_net is None:
             print(f"[duel] {REF_MODEL_PATH} introuvable → duel désactivé")
         self._load()
+        self._load_best_thresholds()
+
+    def _load_best_thresholds(self):
+        """Recharge les records best_* depuis les fichiers best déjà sauvegardés.
+        SANS ça, best_*=0 à chaque relance → le 1er éval écrase le fichier best avec un
+        modèle potentiellement MOINS BON (le filet se sabote). Le seuil DOIT persister
+        pour que `model_best_eval.pt` reste le meilleur de TOUS les runs."""
+        for path, attr, key in (("model_best_eval.pt", "best_eval", "eval_rate"),
+                                ("model_best.pt",      "best_duel", "duel_rate"),
+                                ("model_best_heur.pt", "best_heur", "heur_rate")):
+            p = pathlib.Path(path)
+            if not p.exists():
+                continue
+            try:
+                ck = torch.load(p, weights_only=True)
+                if isinstance(ck, dict) and key in ck:
+                    setattr(self, attr, float(ck[key]))
+                    print(f"[best] seuil {attr}={float(ck[key]):.3f} rechargé ({path})")
+            except Exception as e:
+                print(f"[best] lecture impossible {path}: {e!r}")
 
     def _load(self):
         if not MODEL_PATH.exists():
@@ -288,6 +350,21 @@ class PPOAgent:
         torch.save(ckpt, tmp)
         os.replace(tmp, best_path)
         print(f"[BEST-EVAL] nouveau record vs random={eval_rate:.3f} → {best_path}")
+
+    def save_best_heur(self, heur_rate: float):
+        """Sauvegarde model_best_heur.pt si `heur_rate` (win-rate vs heuristique) bat le
+        record. C'est LE critère qui corrèle avec le niveau humain. Écriture atomique."""
+        if heur_rate <= self.best_heur:
+            return
+        self.best_heur = heur_rate
+        best_path = pathlib.Path("model_best_heur.pt")
+        ckpt = {'net': self.net.state_dict(),
+                'n_updates': self.n_updates, 'n_games': self.n_games,
+                'heur_rate': heur_rate}
+        tmp = best_path.with_suffix('.pt.tmp')
+        torch.save(ckpt, tmp)
+        os.replace(tmp, best_path)
+        print(f"[BEST-HEUR] nouveau record vs heuristique={heur_rate:.3f} → {best_path}")
 
     def sample_opponent_net(self) -> MercuryNet:
         """Tire aléatoirement un snapshot GELÉ du pool (jamais le réseau courant).
@@ -428,6 +505,7 @@ class RLBot:
         self.color      = None
         self._pending   = None
         self._game_over = False  # garde anti-double-fin (gameState gagnant + gameEnded)
+        self._turns     = 0      # nb de mes coups (plafonné par TRAIN_MOVE_CAP)
         self.rollout    = RolloutBuffer()
         # Rôle tiré PAR PARTIE (self-play avec pool conservé) : chaque bot joue soit
         # le réseau courant (→ learner, accumule le gradient), soit un snapshot gelé du
@@ -435,11 +513,18 @@ class RLBot:
         # couleur : ainsi 2-3 bots learner en moyenne alimentent le buffer chaque partie.
         if random.random() < LEARNER_PROB or not self.agent.pool:
             self.game_net = self.agent.net
+            self.role     = 'learner'
+        elif random.random() < HEUR_OPPONENT_PROB:
+            # Adversaire SCRIPTÉ cohérent (≠ self-play). Un seul par partie en moyenne ⇒
+            # pas de gridlock. Aucune inférence réseau, aucun gradient.
+            self.game_net = None
+            self.role     = 'heuristic'
         else:
             self.game_net = self.agent.sample_opponent_net()
+            self.role     = 'pool'
         # is_learner ⇔ "joue le réseau courant" : c'est cette condition (et non un rôle
         # fixe) qui décide si la trajectoire est utilisée pour le gradient.
-        self.is_learner = (self.game_net is self.agent.net)
+        self.is_learner = (self.role == 'learner')
 
     def _flush_rollout(self):
         """Transfère le rollout vers le buffer d'entraînement (learner uniquement)."""
@@ -557,13 +642,31 @@ class RLBot:
                 my_marbles   = mbc[self.color]
                 inv_by_color = _invincible_by_color(gs)
 
-                mask, _ = get_legal_mask(
+                mask, actions = get_legal_mask(
                     hand, my_marbles, self.color, mbc,
                     invincible_by_color=inv_by_color,
                     can_discard=can_discard,
                 )
                 if not any(mask):
                     continue  # ne devrait pas arriver
+
+                self._turns += 1
+                if self._turns > TRAIN_MOVE_CAP:
+                    # Partie dégénérée (gridlock) → on abandonne SANS flush (pas de pollution
+                    # du buffer) et on ferme la WS. run_bot reconnecte pour la suivante.
+                    print(f"[{self.name}] partie >{TRAIN_MOVE_CAP} coups → abandon (anti-gridlock)")
+                    return
+
+                # Adversaire heuristique : coup scripté, pas d'inférence réseau, pas de
+                # gradient (is_learner=False). On joue et on attend le message suivant.
+                if self.role == 'heuristic':
+                    action  = heuristic_pick(gs, self.color, mask, actions)
+                    msg_out = build_server_message(
+                        action, hand, my_marbles, self.color, mbc,
+                        invincible_by_color=inv_by_color,
+                    )
+                    await ws.send(json.dumps(msg_out))
+                    continue
 
                 state_enc               = encode_state(gs, self.color)
                 action, log_prob, value = await self._select_action(loop, state_enc, mask)
@@ -598,8 +701,10 @@ class RLBot:
 
 class EvalBot:
     """Bot d'une partie d'éval/duel. Ne touche NI au buffer NI à recent_wins.
-      - mode='random'  : joue un coup légal uniformément au hasard (baseline).
-      - mode='net'     : joue argmax sur le réseau `net` fourni (greedy, comme la prod).
+      - mode='random'    : joue un coup légal uniformément au hasard (baseline).
+      - mode='heuristic' : joue le bot scripté cohérent (heuristic_bot.heuristic_pick).
+      - mode='plan'      : joue le planificateur de main (plan_hand.plan_hand_pick).
+      - mode='net'       : joue argmax sur le réseau `net` fourni (greedy, comme la prod).
     Si `result_sink` (deque) est fourni, le résultat du bot (1=gagné, 0=perdu) y est
     ajouté en fin de partie. Sert à la fois pour l'éval vs random (1 net + 3 random,
     sink sur le net) et le duel (2 courant + 2 ref, sink sur le courant).
@@ -608,7 +713,7 @@ class EvalBot:
     def __init__(self, agent: PPOAgent, bot_id: str, name: str, mode: str,
                  net=None, result_sink=None, collect_stats: bool = False):
         self.agent       = agent
-        self.mode        = mode          # 'random' | 'net'
+        self.mode        = mode          # 'random' | 'heuristic' | 'plan' | 'net'
         self.net         = net           # réseau à jouer si mode == 'net'
         self.result_sink = result_sink   # deque où enregistrer le résultat (ou None)
         self.bot_id      = bot_id
@@ -640,10 +745,14 @@ class EvalBot:
             "userId":     self.bot_id,
         }))
 
-    def _pick_action(self, gs: dict, mask: list[bool]) -> int:
+    def _pick_action(self, gs: dict, mask: list[bool], actions: list = None) -> int:
         legal_idx = [i for i, ok in enumerate(mask) if ok]
         if self.mode == 'random':
             return random.choice(legal_idx)
+        if self.mode == 'heuristic':
+            return heuristic_pick(gs, self.color, mask, actions)
+        if self.mode == 'plan':
+            return plan_hand_pick(gs, self.color, mask, actions)
         # Greedy : argmax de la politique du réseau fourni (cf. main.py / prod).
         # encode_state_for route vers l'encodeur correct : le ref de duel est un modèle
         # LEGACY (entrée 54) tandis que le réseau courant utilise l'encodage 138-dim.
@@ -709,7 +818,7 @@ class EvalBot:
                 mbc          = _marbles_by_color(gs)
                 my_marbles   = mbc[self.color]
                 inv_by_color = _invincible_by_color(gs)
-                mask, _ = get_legal_mask(
+                mask, actions = get_legal_mask(
                     hand, my_marbles, self.color, mbc,
                     invincible_by_color=inv_by_color,
                     can_discard=gs.get("canDiscard", False),
@@ -717,11 +826,16 @@ class EvalBot:
                 if not any(mask):
                     continue
 
-                action  = self._pick_action(gs, mask)
-                if self.collect_stats:
-                    self.turns_played += 1
-                    if action == DISCARD_IDX:
-                        self.discards += 1
+                action  = self._pick_action(gs, mask, actions)
+                self.turns_played += 1
+                if self.collect_stats and action == DISCARD_IDX:
+                    self.discards += 1
+                if self.turns_played >= EVAL_MOVE_CAP:
+                    # Cap pour TOUS les bots (pas que collect_stats) : sinon un bot non
+                    # plafonné dans une partie gridlockée bloque l'isolated_lock à vie.
+                    # Abandon comptée comme défaite, fermeture de la WS.
+                    self._on_end(None)
+                    return
                 msg_out = build_server_message(
                     action, hand, my_marbles, self.color, mbc,
                     invincible_by_color=inv_by_color,
@@ -748,15 +862,23 @@ async def run_training():
     async def run_bot(color: str):
         bot_id     = f"rl-bot-{color}"
         name       = f"RL-{color.capitalize()}"
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                f"{API_URL}/api/auth/bot",
-                json={"secret": BOT_SECRET, "botId": bot_id, "name": name},
-            )
+        # Auth robuste : si le serveur est lent/redémarre, on RÉESSAYE au lieu de crasher
+        # tout l'entraînement (avant, un ReadTimeout ici tuait le run entier).
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            while True:
+                try:
+                    await client.post(
+                        f"{API_URL}/api/auth/bot",
+                        json={"secret": BOT_SECRET, "botId": bot_id, "name": name},
+                    )
+                    break
+                except Exception as e:
+                    print(f"[{name}] serveur injoignable à l'auth ({e!r}), retry dans 3s…")
+                    await asyncio.sleep(3)
         bot = RLBot(agent, bot_id, name, executor=executor)
         while True:
             try:
-                async with websockets.connect(WS_URL) as ws:
+                async with websockets.connect(WS_URL, max_size=None) as ws:
                     await bot.run(ws)
             except Exception as e:
                 print(f"[{name}] connexion perdue ({e}), reconnexion…")
@@ -777,12 +899,19 @@ async def run_training():
 
             async def play(bot: EvalBot):
                 try:
-                    async with websockets.connect(WS_URL) as ws:
+                    async with websockets.connect(WS_URL, max_size=None) as ws:
                         await bot.run(ws)
                 except Exception as e:
                     print(f"[{bot.name}] partie isolée perdue ({e})")
 
-            await asyncio.gather(*(play(b) for b in bots))
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(play(b) for b in bots)),
+                    timeout=ISOLATED_GAME_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                print(f"[isolated] partie isolée > {ISOLATED_GAME_TIMEOUT}s → abandon "
+                      f"(verrou libéré)")
 
     async def run_eval_game():
         """Éval isolée : 1 bot greedy (réseau courant) + 3 bots aléatoires."""
@@ -836,6 +965,53 @@ async def run_training():
                           f"coups={sum(x[2] for x in losses)/n:.1f}  "
                           f"discards={sum(x[3] for x in losses)/n:.2f}")
 
+    async def run_heuristic_eval_game():
+        """Éval COHÉRENTE (le vrai juge) : 1 bot greedy (réseau courant) + 3 heuristiques."""
+        bots = []
+        net_bot = None
+        for color in COLORS:
+            is_net = (color == EVAL_LEARNER_COLOR)
+            bot = EvalBot(
+                agent, f"heur-bot-{color}",
+                f"HEUR-{'NET' if is_net else 'BOT'}-{color.capitalize()}",
+                mode=('net' if is_net else 'heuristic'),
+                net=(agent.net if is_net else None),
+                result_sink=(agent.heur_wins if is_net else None),
+                collect_stats=is_net,
+            )
+            if is_net:
+                net_bot = bot
+            bots.append(bot)
+        await _play_isolated_game(bots)
+        if net_bot is not None and net_bot._over:
+            agent.heur_finished.append(net_bot.finished)
+            agent.heur_captured.append(net_bot.captured)
+            agent.heur_length.append(net_bot.turns_played)
+            agent.heur_discards.append(net_bot.discards)
+        if agent.heur_wins:
+            rate = sum(agent.heur_wins) / len(agent.heur_wins)
+            if len(agent.heur_wins) >= 20:
+                agent.save_best_heur(rate)
+            print(f"[EVAL-H] vs heuristique : win_rate={rate:.3f} "
+                  f"(n={len(agent.heur_wins)}, dernière={agent.heur_wins[-1]})")
+            if agent.heur_finished:
+                avg = lambda d: sum(d) / len(d)
+                print(f"[EVAL-H] diag TOUTES (moy/partie n={len(agent.heur_finished)}) : "
+                      f"billes_finies={avg(agent.heur_finished):.2f}/4  "
+                      f"captures_subies={avg(agent.heur_captured):.2f}  "
+                      f"coups={avg(agent.heur_length):.1f}  "
+                      f"discards={avg(agent.heur_discards):.2f}")
+                losses = [(f, c, l, d) for w, f, c, l, d in zip(
+                            agent.heur_wins, agent.heur_finished, agent.heur_captured,
+                            agent.heur_length, agent.heur_discards) if w == 0]
+                if losses:
+                    n = len(losses)
+                    print(f"[EVAL-H] diag PERDUES (n={n}) : "
+                          f"billes_finies={sum(x[0] for x in losses)/n:.2f}/4  "
+                          f"captures_subies={sum(x[1] for x in losses)/n:.2f}  "
+                          f"coups={sum(x[2] for x in losses)/n:.1f}  "
+                          f"discards={sum(x[3] for x in losses)/n:.2f}")
+
     async def run_duel_game():
         """Duel isolé : 2 bots jouent le réseau COURANT (greedy), 2 jouent le ref figé,
         en diagonale. On enregistre UNE SEULE valeur par partie : 1 si le camp courant
@@ -867,8 +1043,63 @@ async def run_training():
         print(f"[DUEL] courant vs ref(0.82) : win_rate={rate:.3f} "
               f"(n={len(agent.duel_wins)}, 0.50=égalité) {verdict}")
 
+    async def run_plan_duel_game():
+        """Mesure : 2 bots PLANIFICATEUR de main vs 2 bots RÉSEAU réactif (en diagonale).
+        win_rate = part des parties gagnées par le camp planificateur. 0.50 = égalité ;
+        > 0.50 ⇒ planifier la main bat jouer au coup par coup → le levier qu'on cherche."""
+        bots = []
+        for color in COLORS:
+            is_plan = (color in DUEL_CURRENT_COLORS)   # 2 plan / 2 réseau, en diagonale
+            bots.append(EvalBot(
+                agent, f"plan-bot-{color}",
+                f"PLAN-{'PLN' if is_plan else 'NET'}-{color.capitalize()}",
+                mode=('plan' if is_plan else 'net'),
+                net=(None if is_plan else agent.net),
+                result_sink=None,
+                collect_stats=is_plan,   # cap anti-gridlock + longueur de partie
+            ))
+        await _play_isolated_game(bots)
+        winner_color = next((b._won_color for b in bots if b._won_color is not None), None)
+        if winner_color is None:
+            return
+        agent.plan_wins.append(1 if winner_color in DUEL_CURRENT_COLORS else 0)
+        rate  = sum(agent.plan_wins) / len(agent.plan_wins)
+        coups = next((b.turns_played for b in bots if b.collect_stats), 0)
+        verdict = "PLAN > RÉSEAU ✓" if rate > 0.55 else ""
+        print(f"[PLAN-DUEL] planificateur vs réseau : win_rate={rate:.3f} "
+              f"(n={len(agent.plan_wins)}, 0.50=égalité, coups~{coups}) {verdict}")
+
+    async def run_plan_vs_random_game():
+        """Niveau ABSOLU du planificateur : 1 planificateur greedy vs 3 random. À comparer
+        au 0.83 du réseau et au ~0.999 d'un humain → dit si on s'approche du niveau humain."""
+        bots = []
+        plan_bot = None
+        for color in COLORS:
+            is_plan = (color == EVAL_LEARNER_COLOR)
+            bot = EvalBot(
+                agent, f"planrnd-bot-{color}",
+                f"PLANRND-{'PLN' if is_plan else 'RND'}-{color.capitalize()}",
+                mode=('plan' if is_plan else 'random'),
+                net=None,
+                result_sink=(agent.plan_rnd_wins if is_plan else None),
+                collect_stats=is_plan,
+            )
+            if is_plan:
+                plan_bot = bot
+            bots.append(bot)
+        await _play_isolated_game(bots)
+        if agent.plan_rnd_wins:
+            rate  = sum(agent.plan_rnd_wins) / len(agent.plan_rnd_wins)
+            coups = plan_bot.turns_played if plan_bot else 0
+            print(f"[PLAN-RND] planificateur vs random : win_rate={rate:.3f} "
+                  f"(n={len(agent.plan_rnd_wins)}, coups~{coups})  [humain≈0.999, réseau≈0.83]")
+
     async def update_loop():
-        last_eval = last_duel = 0
+        # L'éval heuristique 1-vs-3 est désactivée (gridlock structurel à 4 joueurs cohérents).
+        # L'heuristique sert désormais d'adversaire d'ENTRAÎNEMENT (cf. _reset_episode), et le
+        # benchmark cohérent reste le DUEL vs ref. run_heuristic_eval_game reste défini au cas
+        # où on voudrait un jour un duel 2-vs-2 heuristique.
+        last_eval = last_duel = last_plan = 0
         while True:
             await asyncio.sleep(2)
             if len(agent.buffer) >= UPDATE_EVERY:
@@ -879,6 +1110,10 @@ async def run_training():
                 if agent.n_updates - last_duel >= DUEL_EVERY:
                     last_duel = agent.n_updates
                     asyncio.create_task(run_duel_game())
+                if agent.n_updates - last_plan >= PLAN_DUEL_EVERY:
+                    last_plan = agent.n_updates
+                    asyncio.create_task(run_plan_duel_game())
+                    asyncio.create_task(run_plan_vs_random_game())
 
     await asyncio.gather(
         *[run_bot(color) for color in COLORS],

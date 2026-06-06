@@ -32,6 +32,7 @@ from mercury_legal_moves import (
     ARRIVAL_POSITIONS,
 )
 from model import MercuryNet, encode_state_for, load_net
+from plan_hand import plan_hand_pick
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -40,6 +41,12 @@ API_URL    = os.environ.get("MERCURY_API_URL", "http://localhost:8080")
 WS_URL     = os.environ.get("MERCURY_WS_URL",  "ws://localhost:8080")
 BOT_SECRET = os.environ.get("MERCURY_BOT_SECRET", "change-me-before-prod")
 MODEL_PATH = pathlib.Path(os.environ.get("MERCURY_MODEL_PATH", "model.pt"))
+
+# Agent joué en prod :
+#   'plan' (défaut) → planificateur de main (recherche multi-cartes, niveau humain vs random,
+#                     bat le réseau ~0.72). N'utilise PAS le réseau.
+#   'net'           → ancien réseau réactif (argmax). Repli si besoin.
+AGENT_MODE = os.environ.get("MERCURY_AGENT", "plan")
 
 LISTEN_HOST = os.environ.get("MERCURY_AGENT_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("MERCURY_AGENT_PORT", os.environ.get("PORT", "8000")))
@@ -56,13 +63,24 @@ BOT_IDENTITIES: list[dict] = [{"botId": str(i)} for i in range(1, 28)]
 # ── Modèle ────────────────────────────────────────────────────────────────────
 
 def load_model():
+    # En mode 'plan', le réseau n'est PAS utilisé → on tolère son absence/incompatibilité
+    # (le planificateur est auto-suffisant). En mode 'net', il reste obligatoire.
     if not MODEL_PATH.exists():
+        if AGENT_MODE == "plan":
+            print(f"[model] {MODEL_PATH} absent — mode planificateur (sans réseau)")
+            return None
         raise FileNotFoundError(f"Modèle introuvable : {MODEL_PATH}")
-    # load_net auto-détecte l'architecture (MercuryNet courant 3×384 OU MercuryNetLegacy
-    # 2×256 des anciens modèles) → la prod reste compatible quel que soit le modèle déployé.
-    net = load_net(MODEL_PATH, map_location="cpu", eval_mode=True)
-    print(f"[model] chargé depuis {MODEL_PATH} ({type(net).__name__})")
-    return net
+    try:
+        # load_net auto-détecte l'architecture (MercuryNet 138-dim courant OU MercuryNetLegacy
+        # 54-dim des anciens modèles) → compatible quel que soit le modèle déployé.
+        net = load_net(MODEL_PATH, map_location="cpu", eval_mode=True)
+        print(f"[model] chargé depuis {MODEL_PATH} ({type(net).__name__})")
+        return net
+    except Exception as e:
+        if AGENT_MODE == "plan":
+            print(f"[model] chargement impossible ({e!r}) — mode planificateur (sans réseau)")
+            return None
+        raise
 
 
 # ── Helpers d'état ────────────────────────────────────────────────────────────
@@ -194,7 +212,7 @@ class InferenceBot:
             hand = gs.get("hand", [])
             mbc  = _marbles_by_color(gs)
             inv_by_color = _invincible_by_color(gs)
-            mask, _ = get_legal_mask(
+            mask, actions = get_legal_mask(
                 hand, mbc[self.color], self.color, mbc,
                 invincible_by_color=inv_by_color,
                 can_discard=gs.get("canDiscard", False),
@@ -202,8 +220,11 @@ class InferenceBot:
             if not any(mask):
                 continue
 
-            state_enc = encode_state_for(self.net, gs, self.color)
-            action    = self._select_action(state_enc, mask)
+            if AGENT_MODE == "plan":
+                action = plan_hand_pick(gs, self.color, mask, actions)
+            else:
+                state_enc = encode_state_for(self.net, gs, self.color)
+                action    = self._select_action(state_enc, mask)
             msg_out   = build_server_message(
                 action, hand, mbc[self.color], self.color, mbc,
                 invincible_by_color=inv_by_color,
