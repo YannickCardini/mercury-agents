@@ -404,7 +404,12 @@ def get_legal_mask(hand: list, marble_positions: list[int],
     for card_idx, card in enumerate(hand):
         if card_idx >= N_SLOTS:
             break
-        card_value = card['value']
+        # Robustesse : si card n'est pas un dict (ex. booléen mal sérialisé), ignorer
+        if not isinstance(card, dict):
+            continue
+        card_value = card.get('value')
+        if not card_value:
+            continue
         base       = card_idx * PER_SLOT
 
         if card_value == '7':
