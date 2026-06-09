@@ -38,6 +38,7 @@ W_CAPTURE  = 120.0   # déni accumulé par capture (× progrès de la cible)
 # ── Évaluation d'un état (mes billes) ─────────────────────────────────────────
 
 def _threatened(pos: int, color: str, mbc: dict) -> bool:
+    """v1 (grossier) : un adversaire est à ≤ THREAT_RANGE cases derrière."""
     if pos not in _MAIN_PATH_IDX or pos == START_POSITIONS[color]:
         return False
     idx = _MAIN_PATH_IDX[pos]
@@ -52,26 +53,57 @@ def _threatened(pos: int, color: str, mbc: dict) -> bool:
     return False
 
 
-def _score_board(my_pawns: list, color: str, mbc: dict, captured: float) -> float:
-    arrival = ARRIVAL_POSITIONS[color]
-    # Réponse adverse (1-ply) : on suppose qu'un adversaire CAPTURE ma bille exposée la plus
-    # AVANCÉE (les humains protègent leur tête et ne la sur-étendent pas dans la zone de
-    # capture). Cette bille ne compte plus → le plan qui expose le leader est dévalué.
-    sniped, best = None, -1.0
-    for i, p in enumerate(my_pawns):
-        if p not in arrival and _threatened(p, color, mbc):
-            pr = marble_progress(p, color)
-            if pr > best:
-                best, sniped = pr, i
-    s = captured
-    for i, p in enumerate(my_pawns):
-        if i == sniped:
-            continue                                  # supposée capturée → 0 crédit
-        prog = marble_progress(p, color)
-        s += W_PROGRESS * prog
-        if p in arrival:
-            s += W_ARRIVAL
-    return s
+# Distances de capture EXACTES : un adversaire me prend s'il a une bille à exactement la
+# distance d'une carte derrière moi (A,2,3,5,6,7,8,9,10,Q) — ou 4 cases DEVANT (carte 4 arrière).
+_FWD_CAPTURE_DISTS = frozenset({1, 2, 3, 5, 6, 7, 8, 9, 10, 12})
+
+
+def _capturable(pos: int, color: str, mbc: dict) -> bool:
+    """v2 (exact) : une bille adverse peut-elle réellement atterrir sur `pos` au prochain
+    tour ? (distance = celle d'une carte légale). Bien plus fidèle que « à ≤7 cases »."""
+    if pos not in _MAIN_PATH_IDX or pos == START_POSITIONS[color]:
+        return False
+    pi = _MAIN_PATH_IDX[pos]
+    for c, positions in mbc.items():
+        if c == color:
+            continue
+        for q in positions:
+            qi = _MAIN_PATH_IDX.get(q)
+            if qi is None:
+                continue
+            if (pi - qi) % _MAIN_PATH_LEN in _FWD_CAPTURE_DISTS:   # capture en avançant
+                return True
+            if (qi - pi) % _MAIN_PATH_LEN == 4:                    # capture au 4 (arrière)
+                return True
+    return False
+
+
+def _make_score(threat_fn):
+    """Évaluateur d'un état de fin de plan. `threat_fn(pos, color, mbc)` décide si ma bille
+    risque d'être capturée → on suppose alors la PLUS AVANCÉE menacée capturée (snipe 1-ply :
+    on ne sur-étend pas sa tête dans la zone de capture). v1 = _threatened, v2 = _capturable."""
+    def score(my_pawns: list, color: str, mbc: dict, captured: float) -> float:
+        arrival = ARRIVAL_POSITIONS[color]
+        sniped, best = None, -1.0
+        for i, p in enumerate(my_pawns):
+            if p not in arrival and threat_fn(p, color, mbc):
+                pr = marble_progress(p, color)
+                if pr > best:
+                    best, sniped = pr, i
+        s = captured
+        for i, p in enumerate(my_pawns):
+            if i == sniped:
+                continue                              # supposée capturée → 0 crédit
+            prog = marble_progress(p, color)
+            s += W_PROGRESS * prog
+            if p in arrival:
+                s += W_ARRIVAL
+        return s
+    return score
+
+
+_score_board   = _make_score(_threatened)   # v1 (défaut, déployé)
+score_board_v2 = _make_score(_capturable)   # v2 (menace exacte)
 
 
 # ── Application d'un de MES coups (adversaires = obstacles, capture = obstacle retiré) ──
@@ -145,10 +177,13 @@ def _legal_entries(hand: list, my_pawns: list, color: str, mbc: dict) -> list:
 
 
 def _search(game_state: dict, color: str, mask: list, actions: list,
-            score_fn=None) -> dict | None:
-    """Renvoie le meilleur nœud terminal {my, opp, first_idx, score}. first_idx est
-    l'index d'action (dans `mask`/`actions`) du PREMIER coup du meilleur plan."""
+            score_fn=None, beam_width: int = None, topk: int = None):
+    """Renvoie le meilleur nœud {my, opp, first_idx, score}. Si `topk` est fourni, renvoie
+    plutôt la LISTE des `topk` meilleurs nœuds par score (pour un re-classement externe,
+    ex. par un réseau de valeur)."""
     score_fn = score_fn or _score_board
+    bw       = beam_width or BEAM_WIDTH
+    pool     = []                          # tous les nœuds vus (pour le top-K éventuel)
 
     mbc0      = {p['color']: list(p['marblePositions']) for p in game_state['players']}
     my_pawns0 = mbc0[color]
@@ -172,10 +207,11 @@ def _search(game_state: dict, color: str, mask: list, actions: list,
         beam.append(node)
 
     if not beam:
-        return None
+        return [] if topk else None
+    pool.extend(beam)
 
     best     = max(beam, key=lambda n: n['score'])
-    frontier = sorted(beam, key=lambda n: n['score'], reverse=True)[:BEAM_WIDTH]
+    frontier = sorted(beam, key=lambda n: n['score'], reverse=True)[:bw]
 
     # ── Approfondissement : on consomme la main restante carte par carte ──
     deadline  = time.monotonic() + MAX_PLAN_SECONDS
@@ -199,17 +235,21 @@ def _search(game_state: dict, color: str, mask: list, actions: list,
                 nxt.append(child)
                 if child['score'] > best['score']:
                     best = child
-        frontier = sorted(nxt, key=lambda n: n['score'], reverse=True)[:BEAM_WIDTH]
+        pool.extend(nxt)
+        frontier = sorted(nxt, key=lambda n: n['score'], reverse=True)[:bw]
 
+    if topk:
+        import heapq
+        return heapq.nlargest(topk, pool, key=lambda n: n['score'])
     return best
 
 
 def plan_hand_pick(game_state: dict, color: str,
-                   mask: list, actions: list, score_fn=None) -> int:
+                   mask: list, actions: list, score_fn=None, beam_width: int = None) -> int:
     """Sélecteur d'action compatible avec heuristic_pick : renvoie l'index (dans `mask`)
     du PREMIER coup du meilleur PLAN trouvé sur la main. Repli sur la défausse si aucun
     coup légal."""
-    best = _search(game_state, color, mask, actions, score_fn)
+    best = _search(game_state, color, mask, actions, score_fn, beam_width)
     if best is None:
         return DISCARD_IDX
     return best['first_idx']

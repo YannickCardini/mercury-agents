@@ -35,12 +35,13 @@ from mercury_legal_moves import (
 
 # ── Constantes d'espace ───────────────────────────────────────────────────────
 
-STATE_DIM        = 138   # encodage courant (main par slot + anneau partagé + flags)
+STATE_DIM        = 143   # encodage courant (main par slot 5×14 + anneau partagé + flags ;
+                         # 14e rang = Joker, cf. mise à jour du jeu → 138→143)
 STATE_DIM_LEGACY = 54    # ancien encodage (bitmask de rangs) — anciens modèles seulement
 ACTION_DIM       = 501   # nombre d'actions (cartes × cibles ou split-7)
 
-# Ordre des rangs pour l'encodage de la main (one-hot par slot).
-_CARD_VALUES = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
+# Ordre des rangs pour l'encodage de la main (one-hot par slot). 14e rang = Joker.
+_CARD_VALUES = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'Joker']
 _CARD_IDX    = {v: i for i, v in enumerate(_CARD_VALUES)}
 
 _DANGER_RANGE = 12   # bille adverse à ≤ 12 cases derrière (≙ Q) = menace de capture
@@ -104,20 +105,20 @@ def _marble_danger(pos: int, color: str, marbles_by_color: dict) -> float:
     return 0.0
 
 
-# ── Encodage d'état COURANT (138 dims) ─────────────────────────────────────────
+# ── Encodage d'état COURANT (143 dims) ─────────────────────────────────────────
 
 def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
-    """Encode l'état du jeu en vecteur de STATE_DIM (138) dimensions.
+    """Encode l'état du jeu en vecteur de STATE_DIM (143) dimensions.
 
     Structure :
       [0:16]    position absolue (anneau partagé) des 16 billes — ma couleur d'abord
       [16:32]   progrès relatif (0→1) des 16 billes vers l'arrivée de leur camp
       [32:48]   flag protégé (sur sa case start) des 16 billes
-      [48:113]  main : 5 slots × 13 rangs one-hot   ← LA correction clé
-      [113]     canDiscard
-      [114:130] flag danger des 16 billes (adversaire ≤ 12 cases derrière)
-      [130:134] fraction de billes en jeu (hors home) par couleur (ma couleur d'abord)
-      [134:138] fraction de billes en zone d'arrivée par couleur
+      [48:118]  main : 5 slots × 14 rangs one-hot (14e = Joker)   ← LA correction clé
+      [118]     canDiscard
+      [119:135] flag danger des 16 billes (adversaire ≤ 12 cases derrière)
+      [135:139] fraction de billes en jeu (hors home) par couleur (ma couleur d'abord)
+      [139:143] fraction de billes en zone d'arrivée par couleur
     """
     vec: list[float] = []
     color_order      = [my_color] + [c for c in ALL_COLORS if c != my_color]
@@ -141,10 +142,10 @@ def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
         for pos in marbles(color):
             vec.append(_marble_safe(pos, color))
 
-    # [48:113] main : 5 slots × 13 rangs one-hot (padding zéros si < 5 cartes)
+    # [48:118] main : 5 slots × 14 rangs one-hot (14e = Joker ; padding zéros si < 5 cartes)
     hand = game_state.get('hand', [])
     for i in range(5):
-        slot = [0.0] * 13
+        slot = [0.0] * 14
         if i < len(hand):
             card  = hand[i]
             value = card.get('value') if isinstance(card, dict) else str(card)

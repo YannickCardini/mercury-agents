@@ -46,6 +46,8 @@ ALL_COLORS = ['red', 'green', 'blue', 'orange']
 CARD_MOVE_DISTANCE = {
     '2': 2, '3': 3, '5': 5, '6': 6, '7': 7,
     '8': 8, '9': 9, '10': 10, 'Q': 12,
+    # Joker joué comme déplacement : +18 (> 12, le max précédent). Cf. JOKER_MOVE_DISTANCE.
+    'Joker': 18,
 }
 
 # Lookups rapides
@@ -245,6 +247,18 @@ def get_legal_action(card_value: str, marble_pos: int,
             return None
         return _build_backward('4', marble_pos, 4, own_marbles, all_marbles,
                                color, marbles_by_color, invincible_by_color)
+
+    # ── Joker : entrer un pion (comme A/K) OU avancer de 18 ─────────────────
+    # (le rejeu qui suit est géré côté serveur ; le bot y réagit via un nouveau gameState)
+    if card_value == 'Joker':
+        if marble_pos in home:
+            if start in own_marbles:
+                return None
+            return {'type': 'enter', 'from': marble_pos, 'to': start}
+        if is_on_main_path(marble_pos):
+            return _build_forward('Joker', marble_pos, 18, own_marbles, all_marbles,
+                                  color, marbles_by_color, invincible_by_color)
+        return None
 
     # ── 2,3,5,6,7,8,9,10,Q : avancer de N ───────────────────────────────────
     dist = CARD_MOVE_DISTANCE.get(card_value)

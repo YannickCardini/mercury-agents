@@ -25,8 +25,8 @@ _THREAT_RANGE = 7   # une bille adverse à ≤ 7 cases derrière menace de captu
 # Malus "économie de cartes" (brise les égalités) : éviter de cramer une carte précieuse
 # sur un coup banal. Petit devant le score de base d'un move (~100).
 _CARD_WASTE = {
-    'Q': 4.0, 'J': 4.0, '7': 4.0, 'K': 2.0, 'A': 2.0, '10': 1.5, '9': 1.0,
-    '8': 1.0, '6': 0.6, '5': 0.5, '4': 1.0, '3': 0.3, '2': 0.2,
+    'Joker': 5.0, 'Q': 4.0, 'J': 4.0, '7': 4.0, 'K': 2.0, 'A': 2.0, '10': 1.5,
+    '9': 1.0, '8': 1.0, '6': 0.6, '5': 0.5, '4': 1.0, '3': 0.3, '2': 0.2,
 }
 
 
