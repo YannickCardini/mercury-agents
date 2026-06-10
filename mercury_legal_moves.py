@@ -208,7 +208,10 @@ def get_legal_action(card_value: str, marble_pos: int,
     Retourne {'type', 'from', 'to'} ou None si le coup est illégal.
     (Le J est géré dans get_legal_mask car la cible du swap est apprise.)
     """
-    if invincible_by_color is None:
+    # Robustesse : tout argument non-dict (None, ou un bool passé par erreur par un
+    # appelant) est traité comme « aucun pion invincible » → ne JAMAIS crasher en
+    # `.get`/`.items` sur un bool (cf. incident prod Joker).
+    if not isinstance(invincible_by_color, dict):
         invincible_by_color = _EMPTY_INV
 
     home  = HOME_POSITIONS[color]
@@ -386,7 +389,8 @@ def get_legal_mask(hand: list, marble_positions: list[int],
       partir de gameState.players[].marbleInvincible (parallèle à marblePositions).
       Si None, suppose aucun pion invincible (déconseillé : peut diverger du serveur).
     """
-    if invincible_by_color is None:
+    # Robustesse : tout non-dict (None ou bool passé par erreur) → aucun invincible.
+    if not isinstance(invincible_by_color, dict):
         invincible_by_color = _EMPTY_INV
 
     all_marbles = [p for positions in marbles_by_color.values() for p in positions]
@@ -404,12 +408,7 @@ def get_legal_mask(hand: list, marble_positions: list[int],
     for card_idx, card in enumerate(hand):
         if card_idx >= N_SLOTS:
             break
-        # Robustesse : si card n'est pas un dict (ex. booléen mal sérialisé), ignorer
-        if not isinstance(card, dict):
-            continue
-        card_value = card.get('value')
-        if not card_value:
-            continue
+        card_value = card['value']
         base       = card_idx * PER_SLOT
 
         if card_value == '7':

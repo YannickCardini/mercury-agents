@@ -109,10 +109,7 @@ def _invincible_by_color(gs: dict) -> dict:
     out = {}
     for p in gs["players"]:
         positions = p["marblePositions"]
-        inv_flags = p.get("marbleInvincible")
-        # Robustesse : si marbleInvincible est absent, faux, ou pas une liste → défaut zéros
-        if not isinstance(inv_flags, list):
-            inv_flags = [False] * len(positions)
+        inv_flags = p.get("marbleInvincible") or [False] * len(positions)
         out[p["color"]] = [pos for pos, inv in zip(positions, inv_flags) if inv]
     return out
 
