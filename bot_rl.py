@@ -491,13 +491,14 @@ class RLBot:
         self.bot_id        = bot_id
         self.name          = name
         self.session_token = ""          # défini avant chaque partie par run_bot
+        self.user_id       = bot_id      # ID serveur, défini avant chaque partie par run_bot
         self.game_net      = agent.net   # réseau utilisé pour cette partie
         self._executor     = executor
         self._reset_episode()
 
     def _resolve_color(self, gs: dict) -> bool:
         for p in gs['players']:
-            if p.get('userId') == self.bot_id:
+            if p.get('userId') == self.user_id:
                 self.color = p['color']
                 return True
         return False
@@ -719,6 +720,7 @@ class EvalBot:
         self.bot_id        = bot_id
         self.name          = name
         self.session_token = ""            # défini avant chaque partie par _play_isolated_game
+        self.user_id       = bot_id        # ID serveur, défini avant chaque partie par _play_isolated_game
         self.color         = None
         self._over       = False
         self._won_color  = None          # couleur gagnante de la partie (lue après coup)
@@ -733,7 +735,7 @@ class EvalBot:
 
     def _resolve_color(self, gs: dict) -> bool:
         for p in gs['players']:
-            if p.get('userId') == self.bot_id:
+            if p.get('userId') == self.user_id:
                 self.color = p['color']
                 return True
         return False
@@ -874,7 +876,9 @@ async def run_training():
                             json={"secret": BOT_SECRET, "botId": bot_id, "name": name},
                         )
                         r.raise_for_status()
-                        bot.session_token = r.json()["sessionToken"]
+                        data = r.json()
+                        bot.session_token = data["sessionToken"]
+                        bot.user_id       = data.get("userId", bot_id)
                         break
                     except Exception as e:
                         print(f"[{name}] serveur injoignable à l'auth ({e!r}), retry dans 3s…")
@@ -899,7 +903,9 @@ async def run_training():
                         json={"secret": BOT_SECRET, "botId": bot.bot_id, "name": bot.name},
                     )
                     r.raise_for_status()
-                    bot.session_token = r.json()["sessionToken"]
+                    data = r.json()
+                    bot.session_token = data["sessionToken"]
+                    bot.user_id       = data.get("userId", bot.bot_id)
 
             async def play(bot: EvalBot):
                 try:

@@ -122,10 +122,11 @@ class InferenceBot:
     def __init__(self, net: MercuryNet, identity: dict):
         self.net    = net
         self.bot_id = identity["botId"]
-        self.name: str         = self.bot_id  # remplacé après authenticate()
-        self.picture: str      = ""            # remplacé après authenticate()
-        self.session_token: str = ""           # remplacé après authenticate()
-        self.color: str | None = None
+        self.name: str          = self.bot_id  # remplacé après authenticate()
+        self.picture: str       = ""            # remplacé après authenticate()
+        self.session_token: str = ""            # remplacé après authenticate()
+        self.user_id: str       = self.bot_id  # ID serveur, remplacé après authenticate()
+        self.color: str | None  = None
 
     async def authenticate(self, client: httpx.AsyncClient) -> None:
         r = await client.post(
@@ -138,10 +139,11 @@ class InferenceBot:
         self.name          = data.get("name", self.bot_id)
         self.picture       = data.get("picture", "")
         self.session_token = data["sessionToken"]
+        self.user_id       = data.get("userId", self.bot_id)
 
     def _resolve_color(self, gs: dict) -> bool:
         for p in gs["players"]:
-            if p.get("userId") == self.bot_id:
+            if p.get("userId") == self.user_id:
                 self.color = p["color"]
                 return True
         return False
