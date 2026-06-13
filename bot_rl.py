@@ -485,13 +485,14 @@ def _invincible_by_color(game_state: dict) -> dict:
 class RLBot:
     def __init__(self, agent: PPOAgent, bot_id: str, name: str,
                  executor: concurrent.futures.Executor = None):
-        self.agent      = agent
-        self.is_learner = True        # (re)décidé par partie dans _reset_episode
-        self.color      = None        # assigned by the server
-        self.bot_id     = bot_id
-        self.name       = name
-        self.game_net   = agent.net   # réseau utilisé pour cette partie
-        self._executor  = executor
+        self.agent         = agent
+        self.is_learner    = True        # (re)décidé par partie dans _reset_episode
+        self.color         = None        # assigned by the server
+        self.bot_id        = bot_id
+        self.name          = name
+        self.session_token = ""          # défini avant chaque partie par run_bot
+        self.game_net      = agent.net   # réseau utilisé pour cette partie
+        self._executor     = executor
         self._reset_episode()
 
     def _resolve_color(self, gs: dict) -> bool:
@@ -570,10 +571,9 @@ class RLBot:
 
     async def _join(self, ws):
         await ws.send(json.dumps({
-            "type":       "joinMatchmaking",
-            "playerName": self.name,
-            "browserId":  self.bot_id,
-            "userId":     self.bot_id,
+            "type":      "joinMatchmaking",
+            "authToken": self.session_token,
+            "name":      self.name,
         }))
 
     def _on_game_end(self, gs: dict | None, winner: str | None) -> bool:
@@ -712,13 +712,14 @@ class EvalBot:
 
     def __init__(self, agent: PPOAgent, bot_id: str, name: str, mode: str,
                  net=None, result_sink=None, collect_stats: bool = False):
-        self.agent       = agent
-        self.mode        = mode          # 'random' | 'heuristic' | 'plan' | 'net'
-        self.net         = net           # réseau à jouer si mode == 'net'
-        self.result_sink = result_sink   # deque où enregistrer le résultat (ou None)
-        self.bot_id      = bot_id
-        self.name        = name
-        self.color       = None
+        self.agent         = agent
+        self.mode          = mode          # 'random' | 'heuristic' | 'plan' | 'net'
+        self.net           = net           # réseau à jouer si mode == 'net'
+        self.result_sink   = result_sink   # deque où enregistrer le résultat (ou None)
+        self.bot_id        = bot_id
+        self.name          = name
+        self.session_token = ""            # défini avant chaque partie par _play_isolated_game
+        self.color         = None
         self._over       = False
         self._won_color  = None          # couleur gagnante de la partie (lue après coup)
         # Diagnostic du mode d'échec (bot net d'éval uniquement). Compteurs accumulés
@@ -739,10 +740,9 @@ class EvalBot:
 
     async def _join(self, ws):
         await ws.send(json.dumps({
-            "type":       "joinMatchmaking",
-            "playerName": self.name,
-            "browserId":  self.bot_id,
-            "userId":     self.bot_id,
+            "type":      "joinMatchmaking",
+            "authToken": self.session_token,
+            "name":      self.name,
         }))
 
     def _pick_action(self, gs: dict, mask: list[bool], actions: list = None) -> int:
@@ -860,23 +860,25 @@ async def run_training():
     # En moyenne ~LEARNER_PROB × 4 bots alimentent le gradient à chaque partie.
 
     async def run_bot(color: str):
-        bot_id     = f"rl-bot-{color}"
-        name       = f"RL-{color.capitalize()}"
-        # Auth robuste : si le serveur est lent/redémarre, on RÉESSAYE au lieu de crasher
-        # tout l'entraînement (avant, un ReadTimeout ici tuait le run entier).
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            while True:
-                try:
-                    await client.post(
-                        f"{API_URL}/api/auth/bot",
-                        json={"secret": BOT_SECRET, "botId": bot_id, "name": name},
-                    )
-                    break
-                except Exception as e:
-                    print(f"[{name}] serveur injoignable à l'auth ({e!r}), retry dans 3s…")
-                    await asyncio.sleep(3)
-        bot = RLBot(agent, bot_id, name, executor=executor)
+        bot_id = f"rl-bot-{color}"
+        name   = f"RL-{color.capitalize()}"
+        bot    = RLBot(agent, bot_id, name, executor=executor)
         while True:
+            # Auth avant chaque partie : token valide pour la durée d'une partie uniquement.
+            # Robuste : on réessaie si le serveur est lent/redémarre.
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                while True:
+                    try:
+                        r = await client.post(
+                            f"{API_URL}/api/auth/bot",
+                            json={"secret": BOT_SECRET, "botId": bot_id, "name": name},
+                        )
+                        r.raise_for_status()
+                        bot.session_token = r.json()["sessionToken"]
+                        break
+                    except Exception as e:
+                        print(f"[{name}] serveur injoignable à l'auth ({e!r}), retry dans 3s…")
+                        await asyncio.sleep(3)
             try:
                 async with websockets.connect(WS_URL, max_size=None) as ws:
                     await bot.run(ws)
@@ -892,10 +894,12 @@ async def run_training():
         async with isolated_lock:
             for bot in bots:
                 async with httpx.AsyncClient() as client:
-                    await client.post(
+                    r = await client.post(
                         f"{API_URL}/api/auth/bot",
                         json={"secret": BOT_SECRET, "botId": bot.bot_id, "name": bot.name},
                     )
+                    r.raise_for_status()
+                    bot.session_token = r.json()["sessionToken"]
 
             async def play(bot: EvalBot):
                 try:

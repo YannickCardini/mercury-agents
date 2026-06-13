@@ -122,8 +122,9 @@ class InferenceBot:
     def __init__(self, net: MercuryNet, identity: dict):
         self.net    = net
         self.bot_id = identity["botId"]
-        self.name: str   = self.bot_id  # remplacé après authenticate()
-        self.picture: str = ""           # remplacé après authenticate()
+        self.name: str         = self.bot_id  # remplacé après authenticate()
+        self.picture: str      = ""            # remplacé après authenticate()
+        self.session_token: str = ""           # remplacé après authenticate()
         self.color: str | None = None
 
     async def authenticate(self, client: httpx.AsyncClient) -> None:
@@ -134,8 +135,9 @@ class InferenceBot:
         )
         r.raise_for_status()
         data = r.json()
-        self.name   = data.get("name", self.bot_id)
-        self.picture = data.get("picture", "")
+        self.name          = data.get("name", self.bot_id)
+        self.picture       = data.get("picture", "")
+        self.session_token = data["sessionToken"]
 
     def _resolve_color(self, gs: dict) -> bool:
         for p in gs["players"]:
@@ -152,11 +154,10 @@ class InferenceBot:
 
     async def _join(self, ws) -> None:
         await ws.send(json.dumps({
-            "type":       "joinMatchmaking",
-            "playerName": self.name,
-            "browserId":  self.bot_id,
-            "userId":     self.bot_id,
-            "picture":    self.picture,
+            "type":      "joinMatchmaking",
+            "authToken": self.session_token,
+            "name":      self.name,
+            "picture":   self.picture,
         }))
 
     async def _maybe_react(self, ws, action: dict) -> None:
