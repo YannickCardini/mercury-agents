@@ -127,6 +127,7 @@ class InferenceBot:
         self.session_token: str = ""            # remplacé après authenticate()
         self.user_id: str       = self.bot_id  # ID serveur, remplacé après authenticate()
         self.color: str | None  = None
+        self._resolve_warned    = False        # diag _resolve_color logué une seule fois
 
     async def authenticate(self, client: httpx.AsyncClient) -> None:
         r = await client.post(
@@ -138,14 +139,38 @@ class InferenceBot:
         data = r.json()
         self.name          = data.get("name", self.bot_id)
         self.picture       = data.get("picture", "")
-        self.session_token = data["sessionToken"]
         self.user_id       = data.get("userId", self.bot_id)
+        self.session_token = data.get("sessionToken", "")
+        if not self.session_token:
+            raise RuntimeError(
+                f"/api/auth/bot n'a pas renvoyé de sessionToken pour botId={self.bot_id} "
+                f"— le backend déployé n'est peut-être pas à jour."
+            )
+        print(f"[{self.name}] authToken OK (len={len(self.session_token)})", flush=True)
 
     def _resolve_color(self, gs: dict) -> bool:
-        for p in gs["players"]:
-            if p.get("userId") == self.user_id:
+        players = gs.get("players", [])
+        # 1) Voie nominale : userId serveur (dérivé de l'authToken).
+        for p in players:
+            if self.user_id and p.get("userId") == self.user_id:
                 self.color = p["color"]
                 return True
+        # 2) Repli par nom de profil. Depuis le durcissement sécurité, le serveur
+        #    dérive l'identité de l'authToken et n'expose plus forcément userId dans
+        #    le gameState diffusé → l'ancien match userId échouait silencieusement et
+        #    le bot ne jouait jamais (timeout à chaque tour). Le nom, envoyé via
+        #    playerName au join, reste un identifiant fiable côté affichage.
+        for p in players:
+            if self.name and p.get("name") == self.name:
+                self.color = p["color"]
+                return True
+        # Échec total : on logue l'état réel UNE fois pour diagnostiquer en prod.
+        if not self._resolve_warned:
+            self._resolve_warned = True
+            summary = [{"color": p.get("color"), "userId": p.get("userId"),
+                        "name": p.get("name")} for p in players]
+            print(f"[{self.name}] _resolve_color échec — self.user_id={self.user_id!r} "
+                  f"self.name={self.name!r} players={summary}", flush=True)
         return False
 
     def _select_action(self, state_enc: torch.Tensor, mask: list[bool]) -> int:
@@ -156,10 +181,10 @@ class InferenceBot:
 
     async def _join(self, ws) -> None:
         await ws.send(json.dumps({
-            "type":      "joinMatchmaking",
-            "authToken": self.session_token,
-            "name":      self.name,
-            "picture":   self.picture,
+            "type":       "joinMatchmaking",
+            "authToken":  self.session_token,
+            "playerName": self.name,
+            "picture":    self.picture,
         }))
 
     async def _maybe_react(self, ws, action: dict) -> None:
