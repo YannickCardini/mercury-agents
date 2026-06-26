@@ -1,7 +1,7 @@
 """
 Réseau de politique et valeur pour le bot RL Mercury.
 
-ENCODAGE COURANT (138 dims) — repris de models/model_v3.py. Point clé : la main est
+ENCODAGE COURANT (143 dims) — repris de models/model_v3.py. Point clé : la main est
 encodée CARTE PAR CARTE (5 slots × 13 rangs), ce que l'ancien encodage 54-dim ne faisait
 pas (il ne donnait qu'un bitmask des rangs présents, sans ordre). Or l'espace d'action
 est indexé PAR SLOT de carte (cf. mercury_legal_moves.py) : sans connaître la carte de
@@ -14,7 +14,7 @@ comparables entre couleurs).
 
 Architecture INCHANGÉE vs la version 54-dim qui convergeait : 2 couches ReLU, têtes
 directes, softmax masqué, hidden=384. On ne change QU'UN seul facteur — l'encodage
-d'entrée (54 → 138). La tentative v3 d'origine échouait parce qu'elle changeait AUSSI
+d'entrée (54 → 143). La tentative v3 d'origine échouait parce qu'elle changeait AUSSI
 l'architecture (3 couches + LayerNorm) en même temps : impossible d'isoler la cause.
 
 ENCODAGE LEGACY (54 dims, encode_state_legacy) + MercuryNetLegacy 2×256 : conservés
@@ -32,6 +32,9 @@ from mercury_legal_moves import (
     HOME_POSITIONS, START_POSITIONS, ARRIVAL_POSITIONS,
     _MAIN_PATH_IDX, _MAIN_PATH_LEN, ALL_COLORS,
 )
+# Progrès d'une bille : source unique dans reward.py (aussi utilisée par plan_hand,
+# heuristic_bot). On la réutilise ici plutôt que d'en redéfinir une copie identique.
+from reward import marble_progress
 
 # ── Constantes d'espace ───────────────────────────────────────────────────────
 
@@ -60,26 +63,6 @@ def _marble_abs_enc(pos: int, color: str) -> float:
         return (57 + arrival.index(pos)) / 61.0
     if pos in _MAIN_PATH_IDX:
         return (_MAIN_PATH_IDX[pos] + 1) / 61.0
-    return 0.0
-
-
-def _marble_progress_norm(pos: int, color: str) -> float:
-    """Progrès normalisé (0–1) d'une bille vers la victoire, RELATIF au start de sa
-    couleur (à quel point cette bille est avancée pour SON camp).
-      0.0  = en HOME            0.05 = vient d'entrer (case start)
-      0.70 = tour complet fait  0.775..1.0 = zone d'arrivée slot 0→3
-    """
-    if pos in HOME_POSITIONS[color]:
-        return 0.0
-    arrival = ARRIVAL_POSITIONS[color]
-    if pos in arrival:
-        i = arrival.index(pos)
-        return 0.775 + i * 0.075            # 0.775, 0.85, 0.925, 1.0
-    if pos in _MAIN_PATH_IDX:
-        start_idx = _MAIN_PATH_IDX[START_POSITIONS[color]]
-        pos_idx   = _MAIN_PATH_IDX[pos]
-        steps     = (pos_idx - start_idx) % _MAIN_PATH_LEN
-        return 0.05 + steps / _MAIN_PATH_LEN * 0.65   # 0.05 → 0.70
     return 0.0
 
 
@@ -135,7 +118,7 @@ def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
     # [16:32] progrès relatif au camp
     for color in color_order:
         for pos in marbles(color):
-            vec.append(_marble_progress_norm(pos, color))
+            vec.append(marble_progress(pos, color))
 
     # [32:48] flag protégé (case start)
     for color in color_order:
@@ -154,20 +137,20 @@ def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
                 slot[ci] = 1.0
         vec.extend(slot)
 
-    # [113] canDiscard
+    # [118] canDiscard
     vec.append(1.0 if game_state.get('canDiscard', False) else 0.0)
 
-    # [114:130] flag danger
+    # [119:135] flag danger
     for color in color_order:
         for pos in marbles(color):
             vec.append(_marble_danger(pos, color, marbles_by_color))
 
-    # [130:134] fraction de billes en jeu (hors home) par couleur
+    # [135:139] fraction de billes en jeu (hors home) par couleur
     for color in color_order:
         ms = marbles(color)
         vec.append(sum(1 for p in ms if p not in HOME_POSITIONS[color]) / 4.0)
 
-    # [134:138] fraction de billes en zone d'arrivée par couleur
+    # [139:143] fraction de billes en zone d'arrivée par couleur
     for color in color_order:
         ms = marbles(color)
         vec.append(sum(1 for p in ms if p in ARRIVAL_POSITIONS[color]) / 4.0)
@@ -197,13 +180,13 @@ def encode_state_legacy(game_state: dict, my_color: str) -> torch.Tensor:
                 idx += 1
 
     for i, pos in enumerate(my_marbles):
-        feat[16 + i] = _marble_progress_norm(pos, my_color)
+        feat[16 + i] = marble_progress(pos, my_color)
 
     idx = 20
     for color in ALL_COLORS:
         if color != my_color:
             for pos in marbles_by_color.get(color, [0, 0, 0, 0]):
-                feat[idx] = _marble_progress_norm(pos, color)
+                feat[idx] = marble_progress(pos, color)
                 idx += 1
 
     for i, color in enumerate(ALL_COLORS):
@@ -229,7 +212,7 @@ def encode_state_legacy(game_state: dict, my_color: str) -> torch.Tensor:
 def encode_state_for(net: nn.Module, game_state: dict, my_color: str) -> torch.Tensor:
     """Route vers le bon encodeur selon la largeur d'entrée du réseau :
       - entrée 54  → encode_state_legacy (anciens modèles, ex. ref 0.82)
-      - sinon (138) → encode_state (encodage courant)."""
+      - sinon (143) → encode_state (encodage courant)."""
     if net.fc1.in_features == STATE_DIM_LEGACY:
         return encode_state_legacy(game_state, my_color)
     return encode_state(game_state, my_color)
@@ -244,60 +227,50 @@ def _apply_mask_dist(logits: torch.Tensor, legal_mask: torch.Tensor) -> Categori
     return Categorical(F.softmax(logits, dim=-1))
 
 
-class MercuryNet(nn.Module):
-    """
-    Réseau PPO : politique + valeur. Entrée = encodage COURANT (STATE_DIM=138).
-    Architecture identique à la version 54-dim qui convergeait (2 couches, ReLU nu,
-    têtes directes, softmax masqué) — SEUL l'encodage d'entrée change (54 → 138).
-    """
+class _PolicyValueNet(nn.Module):
+    """Tronc commun politique + valeur : 2 couches ReLU nu, têtes directes, softmax masqué.
+    Les sous-classes ne fixent QUE la largeur d'entrée (`in_features`) et la largeur cachée
+    par défaut — l'architecture est volontairement identique. Les modules sont nommés
+    `fc1/fc2/policy_head/value_head` (clés du state_dict) : les checkpoints existants
+    restent chargeables et `load_net`/`encode_state_for` peuvent lire `fc1.in_features`."""
+
+    def __init__(self, in_features: int, hidden_dim: int):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.fc1 = nn.Linear(in_features, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.policy_head = nn.Linear(hidden_dim, ACTION_DIM)
+        self.value_head  = nn.Linear(hidden_dim, 1)
+
+    def forward(self, state: torch.Tensor, legal_mask: torch.Tensor) -> tuple:
+        is_batch = state.dim() == 2
+        if not is_batch:
+            state = state.unsqueeze(0)
+            legal_mask = legal_mask.unsqueeze(0)
+        h = F.relu(self.fc1(state))
+        h = F.relu(self.fc2(h))
+        dist  = _apply_mask_dist(self.policy_head(h), legal_mask)
+        value = self.value_head(h).squeeze(-1)
+        if not is_batch:
+            value = value.squeeze(0)
+        return dist, value
+
+
+class MercuryNet(_PolicyValueNet):
+    """Réseau PPO courant. Entrée = encodage COURANT (STATE_DIM=143). Architecture
+    identique à la version 54-dim qui convergeait — SEUL l'encodage d'entrée change."""
 
     def __init__(self, hidden_dim: int = 384):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.fc1 = nn.Linear(STATE_DIM, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.policy_head = nn.Linear(hidden_dim, ACTION_DIM)
-        self.value_head  = nn.Linear(hidden_dim, 1)
-
-    def forward(self, state: torch.Tensor, legal_mask: torch.Tensor) -> tuple:
-        is_batch = state.dim() == 2
-        if not is_batch:
-            state = state.unsqueeze(0)
-            legal_mask = legal_mask.unsqueeze(0)
-        h = F.relu(self.fc1(state))
-        h = F.relu(self.fc2(h))
-        dist  = _apply_mask_dist(self.policy_head(h), legal_mask)
-        value = self.value_head(h).squeeze(-1)
-        if not is_batch:
-            value = value.squeeze(0)
-        return dist, value
+        super().__init__(STATE_DIM, hidden_dim)
 
 
-class MercuryNetLegacy(nn.Module):
-    """Architecture HISTORIQUE (2×256, ReLU nu) + entrée LEGACY (STATE_DIM_LEGACY=54).
-    Conservée UNIQUEMENT pour charger les anciens checkpoints (ex. model_ref_082.pt,
-    l'agent 0.82 en prod) comme adversaire de duel. Ne sert plus à l'entraînement."""
+class MercuryNetLegacy(_PolicyValueNet):
+    """Architecture HISTORIQUE (2×256) + entrée LEGACY (STATE_DIM_LEGACY=54). Conservée
+    UNIQUEMENT pour charger les anciens checkpoints (ex. model_ref_082.pt, l'agent 0.82
+    en prod) comme adversaire de duel. Ne sert plus à l'entraînement."""
 
     def __init__(self, hidden_dim: int = 256):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.fc1 = nn.Linear(STATE_DIM_LEGACY, hidden_dim)
-        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.policy_head = nn.Linear(hidden_dim, ACTION_DIM)
-        self.value_head  = nn.Linear(hidden_dim, 1)
-
-    def forward(self, state: torch.Tensor, legal_mask: torch.Tensor) -> tuple:
-        is_batch = state.dim() == 2
-        if not is_batch:
-            state = state.unsqueeze(0)
-            legal_mask = legal_mask.unsqueeze(0)
-        h = F.relu(self.fc1(state))
-        h = F.relu(self.fc2(h))
-        dist  = _apply_mask_dist(self.policy_head(h), legal_mask)
-        value = self.value_head(h).squeeze(-1)
-        if not is_batch:
-            value = value.squeeze(0)
-        return dist, value
+        super().__init__(STATE_DIM_LEGACY, hidden_dim)
 
 
 # ── Chargement auto-détectant l'architecture ──────────────────────────────────
@@ -306,7 +279,7 @@ def load_net(path, map_location="cpu", eval_mode: bool = True) -> nn.Module:
     """Charge un checkpoint (dict {net,...} ou state_dict brut) dans la BONNE
     architecture, auto-détectée par la LARGEUR D'ENTRÉE (`fc1.weight` → in_features) :
       - in_features == 54 → MercuryNetLegacy (anciens modèles, encodage legacy)
-      - sinon (138)        → MercuryNet (encodage courant)
+      - sinon (143)        → MercuryNet (encodage courant)
     La largeur cachée (256/384) est lue depuis le checkpoint. Renvoie le réseau prêt."""
     ckpt   = torch.load(path, weights_only=True, map_location=map_location)
     state  = ckpt['net'] if isinstance(ckpt, dict) and 'net' in ckpt else ckpt

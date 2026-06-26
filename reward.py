@@ -5,11 +5,9 @@ La récompense est calculée entre deux états successifs du même joueur
 """
 
 from mercury_legal_moves import (
-    MAIN_PATH, HOME_POSITIONS, START_POSITIONS, ARRIVAL_POSITIONS,
+    HOME_POSITIONS, START_POSITIONS, ARRIVAL_POSITIONS,
     _MAIN_PATH_IDX, _MAIN_PATH_LEN, _ALL_STARTS, ALL_COLORS,
 )
-
-_ALL_HOME = {p for positions in HOME_POSITIONS.values() for p in positions}
 
 # ── Coefficients du shaping ───────────────────────────────────────────────────
 # ÉCHELLE ÷10 (vs la version précédente) : les retours s'étalent désormais sur ~±3

@@ -18,14 +18,18 @@ Service de bots d'IA pour le jeu Mercury. Expose une API HTTP pilotée par webho
 
 Serveur HTTP/WebSocket déployé sur Azure. Gère 27 identités de bots disponibles en parallèle pour remplir le matchmaking.
 
+**Agent joué en prod** (`MERCURY_AGENT`, défaut `plan`) :
+- `plan` (défaut) → **planificateur de main** (`plan_hand.py`) : recherche en faisceau de la
+  meilleure séquence de cartes. N'utilise PAS le réseau de neurones.
+- `net` → ancien réseau réactif (argmax greedy sur les 501 actions légales). Repli si besoin.
+
 **Cycle de vie d'une partie :**
 1. Le backend appelle `POST /dispatch` avec l'ID de partie
 2. Un bot disponible ouvre un WebSocket vers le serveur Mercury
 3. À chaque tour du bot :
-   - L'état de jeu (54 features) est encodé en vecteur numérique
-   - Le réseau de neurones calcule la distribution de probabilité sur les 501 actions légales
-   - Le bot joue l'action avec la **probabilité maximale (greedy)**
-   - Un délai simulé (1–8.5 secondes) est ajouté pour imiter un joueur humain
+   - L'agent (planificateur ou réseau, selon `MERCURY_AGENT`) choisit une action parmi les
+     501 actions légales calculées par `mercury_legal_moves.py`
+   - Un délai simulé (0.5–8.5 secondes) est ajouté pour imiter un joueur humain
 4. Fin de partie → bot libéré et disponible à nouveau
 
 > En production, le modèle est **figé** : aucun apprentissage n'a lieu pendant les parties. Pour améliorer le modèle, il faut entraîner via `bot_rl.py` puis redéployer.
@@ -44,7 +48,7 @@ Script d'entraînement à lancer **localement** avec un serveur Mercury local su
 1. Les 4 bots jouent des parties complètes en parallèle
 2. Le learner collecte ses transitions : `(état, action, log_prob, valeur, reward)`
 3. Toutes les **512 transitions** collectées → une mise à jour PPO
-4. Tous les **10 updates** → snapshot sauvegardé dans `models/snapshot_XXXXXX.pt`
+4. Tous les **25 updates** → snapshot sauvegardé dans `models/snapshot_XXXXXX.pt`
 
 **Hyperparamètres PPO :**
 
@@ -54,13 +58,13 @@ Script d'entraînement à lancer **localement** avec un serveur Mercury local su
 | `GAE_LAMBDA`     | 0.95   | Lissage de l'avantage (GAE)               |
 | `CLIP_EPS`       | 0.2    | Plafond du ratio de politique (stabilité) |
 | `LR`             | 3e-4   | Learning rate Adam                        |
-| `ENTROPY_COEF`   | 0.01   | Bonus d'entropie (encourage l'exploration)|
+| `ENTROPY_COEF`   | 0.015  | Bonus d'entropie (encourage l'exploration)|
 | `VALUE_COEF`     | 0.5    | Poids de la loss du critique              |
-| `UPDATE_EVERY`   | 512   | Transitions accumulées avant update       |
+| `UPDATE_EVERY`   | 512    | Transitions accumulées avant update       |
 | `PPO_EPOCHS`     | 4      | Epochs de gradient par update             |
 | `BATCH_SIZE`     | 64     | Taille des mini-batches                   |
-| `POOL_SIZE`      | 5      | Nombre de snapshots adversaires conservés |
-| `SNAPSHOT_EVERY` | 10     | Fréquence de sauvegarde des snapshots     |
+| `POOL_SIZE`      | 18     | Nombre de snapshots adversaires conservés |
+| `SNAPSHOT_EVERY` | 25     | Fréquence de sauvegarde des snapshots     |
 
 **Lancer l'entraînement :**
 ```bash
@@ -83,7 +87,7 @@ Après entraînement, copier le meilleur snapshot en `model.pt` et pousser sur `
 
 ### `model.py` — Réseau de neurones
 
-**Encodage de l'état (138 dimensions) :**
+**Encodage de l'état (143 dimensions) :**
 
 Le plateau est une grille 15×15 (cases 0–224) dont seules **56 cases** forment l'anneau de jeu (`MAIN_PATH`), plus **8 cases par couleur** (4 HOME + 4 ARRIVAL). Les positions brutes ne sont donc pas comparables telles quelles : on encode chaque bille par son **index d'anneau partagé** (0–55, normalisé /61), repère commun à toutes les couleurs.
 
@@ -94,19 +98,19 @@ Le plateau est une grille 15×15 (cases 0–224) dont seules **56 cases** formen
 | Position absolue      | [0:16]      | 16 billes (ma couleur d'abord), index d'anneau MAIN_PATH /61 |
 | Progrès relatif       | [16:32]     | Progrès 0→1 des 16 billes vers l'arrivée de leur camp        |
 | Flag protégé          | [32:48]     | 1 si la bille est sur sa case start (invulnérable)           |
-| **Main (par slot)**   | [48:113]    | **5 slots × 13 rangs one-hot — quelle carte dans quel slot** |
-| canDiscard            | [113]       | Flag booléen                                                 |
-| Flag danger           | [114:130]   | 1 si un adversaire est à ≤ 12 cases derrière la bille        |
-| Fraction en jeu       | [130:134]   | Billes hors home par couleur (normalisé /4)                  |
-| Fraction en arrivée   | [134:138]   | Billes en zone d'arrivée par couleur (normalisé /4)          |
+| **Main (par slot)**   | [48:118]    | **5 slots × 14 rangs one-hot — quelle carte dans quel slot (14e = Joker)** |
+| canDiscard            | [118]       | Flag booléen                                                 |
+| Flag danger           | [119:135]   | 1 si un adversaire est à ≤ 12 cases derrière la bille        |
+| Fraction en jeu       | [135:139]   | Billes hors home par couleur (normalisé /4)                  |
+| Fraction en arrivée   | [139:143]   | Billes en zone d'arrivée par couleur (normalisé /4)          |
 
 **Architecture du réseau :**
 ```
-Entrée (138) → FC(384, ReLU) → FC(384, ReLU) → Policy head (501 actions)
+Entrée (143) → FC(384, ReLU) → FC(384, ReLU) → Policy head (501 actions)
                                               → Value head (1 scalaire)
 ```
 - Les actions illégales sont masquées (`-inf` dans le softmax) avant l'échantillonnage
-- Architecture volontairement **identique** à la version 54-dim qui convergeait : on n'a changé **qu'un seul facteur**, l'encodage d'entrée (54 → 138), pour en isoler l'effet
+- Architecture volontairement **identique** à la version 54-dim qui convergeait : on n'a changé **qu'un seul facteur**, l'encodage d'entrée (54 → 143), pour en isoler l'effet
 
 ---
 
@@ -149,6 +153,17 @@ Calcule le masque des **501 actions légales** à partir de la main et des posit
 | 4     | Reculer de 4 cases                                               |
 | 7     | Avancer de 7 (avec option de diviser entre deux marbles)         |
 | J     | Échanger une marble propre avec une marble adverse               |
+
+---
+
+### Autres modules
+
+| Fichier             | Rôle                                                                          |
+|---------------------|-------------------------------------------------------------------------------|
+| `plan_hand.py`      | Planificateur de main (recherche en faisceau). **Agent prod par défaut.**     |
+| `heuristic_bot.py`  | Bot scripté cohérent — adversaire d'entraînement et benchmark.                |
+| `mercury_sim.py`    | Simulateur de partie local (sans serveur) — base de la R&D AlphaZero-lite.    |
+| `mercury_az.py`     | **Expérimental** : entraîne un réseau de valeur (`value_net.pt`) en self-play simulé. Script autonome, non branché sur la prod. |
 
 ---
 

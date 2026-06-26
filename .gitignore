@@ -15,6 +15,13 @@ bot_id.txt
 # Snapshots d'entraînement (non nécessaires en prod)
 models/
 
+# Backups et artefacts expérimentaux (non trackés)
+model_best_heur.pt
+model_best_eval0.82_state54.pt
+model_legacy54_backup.pt
+model_best_legacy54_backup.pt
+value_net.pt
+
 # IDE
 .vscode/
 .idea/

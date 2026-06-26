@@ -133,7 +133,12 @@ def _apply(my_pawns: list, opp: dict, color: str, action: dict) -> tuple:
     t = action['type']
 
     if t == 'swap':
-        # mon pion (from) ↔ bille adverse (to) : positions échangées
+        # mon pion (from) ↔ bille adverse (to) : positions échangées.
+        # On NE récompense PAS le recul infligé à l'adversaire : le J ne doit servir
+        # QUE ma propre course. Mon gain (mon pion saute vers `to`) est déjà crédité par
+        # W_PROGRESS dans le score de fin de plan → le planificateur ne joue le J que
+        # quand il fait réellement avancer mon pion, jamais pour seulement embêter un
+        # joueur (les « spite swaps » d'un adversaire avancé mais sans bénéfice pour moi).
         owner = None
         for c, v in opp.items():
             for i, p in enumerate(v):
@@ -143,8 +148,7 @@ def _apply(my_pawns: list, opp: dict, color: str, action: dict) -> tuple:
         move_pawn(action['from'], action['to'])
         if owner is not None:
             c, i = owner
-            gain += W_CAPTURE * marble_progress(action['to'], c)  # l'adverse recule
-            opp[c][i] = action['from']
+            opp[c][i] = action['from']   # l'adverse recule (effet de bord), non récompensé
         return mp, opp, gain
 
     # move / capture / promote / enter (+ 7-split : 2e demi-coup)

@@ -19,9 +19,14 @@ from mercury_legal_moves import (
     get_legal_mask, build_server_message, DISCARD_IDX,
     ARRIVAL_POSITIONS, HOME_POSITIONS, ALL_COLORS,
 )
+from game_state_utils import (
+    detect_winner as _detect_winner,
+    marbles_by_color as _marbles_by_color,
+    invincible_by_color as _invincible_by_color,
+)
 from reward  import compute_reward, terminal_reward
 from model   import (
-    MercuryNet, encode_state, encode_state_for, load_net, ACTION_DIM, STATE_DIM,
+    MercuryNet, encode_state, encode_state_for, load_net,
 )
 from heuristic_bot import heuristic_pick
 from plan_hand     import plan_hand_pick
@@ -67,12 +72,6 @@ HEUR_OPPONENT_PROB = 0.2
 EVAL_EVERY        = 10   # lancer une partie d'éval tous les N updates PPO
 EVAL_WINDOW       = 50   # fenêtre glissante de l'eval win-rate
 EVAL_LEARNER_COLOR = ALL_COLORS[0]  # couleur du bot greedy dans le quatuor d'éval
-
-# ── Évaluation vs bot HEURISTIQUE (adversaire cohérent) ─────────────────────────
-# vs random est devenu un simple plancher (il a fini son rôle : trouver le bug de
-# capture). Le vrai juge — celui qui corrèle avec le niveau humain — est le win-rate
-# d'1 net greedy contre 3 bots heuristiques (jeu cohérent, cf. heuristic_bot.py).
-HEUR_EVERY = 10   # lancer une partie net vs 3 heuristiques tous les N updates PPO
 
 # Plafond de coups d'une partie d'éval : au-delà, on l'abandonne (comptée comme défaite).
 # Évite les parties dégénérées qui tournent en rond (gridlock) et bloquent l'isolated_lock /
@@ -209,13 +208,6 @@ class PPOAgent:
         self.eval_captured = deque(maxlen=EVAL_WINDOW)
         self.eval_length   = deque(maxlen=EVAL_WINDOW)
         self.eval_discards = deque(maxlen=EVAL_WINDOW)
-        # Métrique COHÉRENTE (le vrai juge) : net greedy vs 3 heuristiques. Mêmes diagnostics.
-        self.heur_wins     = deque(maxlen=EVAL_WINDOW)
-        self.heur_finished = deque(maxlen=EVAL_WINDOW)
-        self.heur_captured = deque(maxlen=EVAL_WINDOW)
-        self.heur_length   = deque(maxlen=EVAL_WINDOW)
-        self.heur_discards = deque(maxlen=EVAL_WINDOW)
-        self.best_heur     = 0.0   # meilleur win-rate vs heuristique → auto-save
         # Win-rate du réseau courant vs l'agent de référence (0.82 prod) en duel direct :
         # LE critère de remplacement prod. Un candidat doit dépasser DUEL_REPLACE_THRESHOLD.
         self.duel_wins = deque(maxlen=DUEL_WINDOW)
@@ -244,8 +236,7 @@ class PPOAgent:
         modèle potentiellement MOINS BON (le filet se sabote). Le seuil DOIT persister
         pour que `model_best_eval.pt` reste le meilleur de TOUS les runs."""
         for path, attr, key in (("model_best_eval.pt", "best_eval", "eval_rate"),
-                                ("model_best.pt",      "best_duel", "duel_rate"),
-                                ("model_best_heur.pt", "best_heur", "heur_rate")):
+                                ("model_best.pt",      "best_duel", "duel_rate")):
             p = pathlib.Path(path)
             if not p.exists():
                 continue
@@ -274,7 +265,7 @@ class PPOAgent:
                 self.net.load_state_dict(ckpt)
                 print(f"Modèle chargé depuis {MODEL_PATH} (ancien format state_dict brut)")
         except RuntimeError:
-            # STATE_DIM a changé (passage à l'encodage 138-dim) → l'ancien checkpoint n'est
+            # STATE_DIM a changé (passage au nouvel encodage par slot) → l'ancien checkpoint n'est
             # plus chargeable. On met de côté les modèles déployables (au lieu de les
             # supprimer) pour ne rien perdre, puis on repart de zéro.
             backup = MODEL_PATH.with_name("model_legacy54_backup.pt")
@@ -350,21 +341,6 @@ class PPOAgent:
         torch.save(ckpt, tmp)
         os.replace(tmp, best_path)
         print(f"[BEST-EVAL] nouveau record vs random={eval_rate:.3f} → {best_path}")
-
-    def save_best_heur(self, heur_rate: float):
-        """Sauvegarde model_best_heur.pt si `heur_rate` (win-rate vs heuristique) bat le
-        record. C'est LE critère qui corrèle avec le niveau humain. Écriture atomique."""
-        if heur_rate <= self.best_heur:
-            return
-        self.best_heur = heur_rate
-        best_path = pathlib.Path("model_best_heur.pt")
-        ckpt = {'net': self.net.state_dict(),
-                'n_updates': self.n_updates, 'n_games': self.n_games,
-                'heur_rate': heur_rate}
-        tmp = best_path.with_suffix('.pt.tmp')
-        torch.save(ckpt, tmp)
-        os.replace(tmp, best_path)
-        print(f"[BEST-HEUR] nouveau record vs heuristique={heur_rate:.3f} → {best_path}")
 
     def sample_opponent_net(self) -> MercuryNet:
         """Tire aléatoirement un snapshot GELÉ du pool (jamais le réseau courant).
@@ -457,30 +433,6 @@ class PPOAgent:
 
 
 # ── Bot individuel ────────────────────────────────────────────────────────────
-
-def _has_won(marble_positions: list[int], color: str) -> bool:
-    arrival = ARRIVAL_POSITIONS[color]
-    return all(p in arrival for p in marble_positions)
-
-def _detect_winner(game_state: dict) -> str | None:
-    for player in game_state['players']:
-        if _has_won(player['marblePositions'], player['color']):
-            return player['color']
-    return None
-
-def _marbles_by_color(game_state: dict) -> dict:
-    return {p['color']: p['marblePositions'] for p in game_state['players']}
-
-def _invincible_by_color(game_state: dict) -> dict:
-    """Reconstruit {color: [positions invincibles]} depuis marbleInvincible,
-    tableau parallèle à marblePositions envoyé par le serveur."""
-    out = {}
-    for p in game_state['players']:
-        positions = p['marblePositions']
-        inv_flags = p.get('marbleInvincible') or [False] * len(positions)
-        out[p['color']] = [pos for pos, inv in zip(positions, inv_flags) if inv]
-    return out
-
 
 class RLBot:
     def __init__(self, agent: PPOAgent, bot_id: str, name: str,
@@ -596,8 +548,6 @@ class RLBot:
         # mesurer les snapshots gelés brouillerait la métrique de progression.
         if self.is_learner:
             self.agent.recent_wins.append(1 if won else 0)
-        result = "GAGNÉ" if won else "perdu"
-        # print(f"[{self.name}] {result} (gagnant : {winner})")
         return True
 
     async def run(self, ws):
@@ -757,7 +707,7 @@ class EvalBot:
             return plan_hand_pick(gs, self.color, mask, actions)
         # Greedy : argmax de la politique du réseau fourni (cf. main.py / prod).
         # encode_state_for route vers l'encodeur correct : le ref de duel est un modèle
-        # LEGACY (entrée 54) tandis que le réseau courant utilise l'encodage 138-dim.
+        # LEGACY (entrée 54) tandis que le réseau courant utilise l'encodage 143-dim.
         state_enc = encode_state_for(self.net, gs, self.color)
         legal     = torch.tensor(mask, dtype=torch.bool)
         with torch.no_grad():
@@ -975,53 +925,6 @@ async def run_training():
                           f"coups={sum(x[2] for x in losses)/n:.1f}  "
                           f"discards={sum(x[3] for x in losses)/n:.2f}")
 
-    async def run_heuristic_eval_game():
-        """Éval COHÉRENTE (le vrai juge) : 1 bot greedy (réseau courant) + 3 heuristiques."""
-        bots = []
-        net_bot = None
-        for color in COLORS:
-            is_net = (color == EVAL_LEARNER_COLOR)
-            bot = EvalBot(
-                agent, f"heur-bot-{color}",
-                f"HEUR-{'NET' if is_net else 'BOT'}-{color.capitalize()}",
-                mode=('net' if is_net else 'heuristic'),
-                net=(agent.net if is_net else None),
-                result_sink=(agent.heur_wins if is_net else None),
-                collect_stats=is_net,
-            )
-            if is_net:
-                net_bot = bot
-            bots.append(bot)
-        await _play_isolated_game(bots)
-        if net_bot is not None and net_bot._over:
-            agent.heur_finished.append(net_bot.finished)
-            agent.heur_captured.append(net_bot.captured)
-            agent.heur_length.append(net_bot.turns_played)
-            agent.heur_discards.append(net_bot.discards)
-        if agent.heur_wins:
-            rate = sum(agent.heur_wins) / len(agent.heur_wins)
-            if len(agent.heur_wins) >= 20:
-                agent.save_best_heur(rate)
-            print(f"[EVAL-H] vs heuristique : win_rate={rate:.3f} "
-                  f"(n={len(agent.heur_wins)}, dernière={agent.heur_wins[-1]})")
-            if agent.heur_finished:
-                avg = lambda d: sum(d) / len(d)
-                print(f"[EVAL-H] diag TOUTES (moy/partie n={len(agent.heur_finished)}) : "
-                      f"billes_finies={avg(agent.heur_finished):.2f}/4  "
-                      f"captures_subies={avg(agent.heur_captured):.2f}  "
-                      f"coups={avg(agent.heur_length):.1f}  "
-                      f"discards={avg(agent.heur_discards):.2f}")
-                losses = [(f, c, l, d) for w, f, c, l, d in zip(
-                            agent.heur_wins, agent.heur_finished, agent.heur_captured,
-                            agent.heur_length, agent.heur_discards) if w == 0]
-                if losses:
-                    n = len(losses)
-                    print(f"[EVAL-H] diag PERDUES (n={n}) : "
-                          f"billes_finies={sum(x[0] for x in losses)/n:.2f}/4  "
-                          f"captures_subies={sum(x[1] for x in losses)/n:.2f}  "
-                          f"coups={sum(x[2] for x in losses)/n:.1f}  "
-                          f"discards={sum(x[3] for x in losses)/n:.2f}")
-
     async def run_duel_game():
         """Duel isolé : 2 bots jouent le réseau COURANT (greedy), 2 jouent le ref figé,
         en diagonale. On enregistre UNE SEULE valeur par partie : 1 si le camp courant
@@ -1105,10 +1008,9 @@ async def run_training():
                   f"(n={len(agent.plan_rnd_wins)}, coups~{coups})  [humain≈0.999, réseau≈0.83]")
 
     async def update_loop():
-        # L'éval heuristique 1-vs-3 est désactivée (gridlock structurel à 4 joueurs cohérents).
+        # L'éval heuristique 1-vs-3 est abandonnée (gridlock structurel à 4 joueurs cohérents).
         # L'heuristique sert désormais d'adversaire d'ENTRAÎNEMENT (cf. _reset_episode), et le
-        # benchmark cohérent reste le DUEL vs ref. run_heuristic_eval_game reste défini au cas
-        # où on voudrait un jour un duel 2-vs-2 heuristique.
+        # benchmark cohérent reste le DUEL vs ref.
         last_eval = last_duel = last_plan = 0
         while True:
             await asyncio.sleep(2)

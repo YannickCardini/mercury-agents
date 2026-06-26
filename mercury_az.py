@@ -6,7 +6,7 @@ fort (tier T2). Le simulateur rend la génération de données rapide (le blocag
 Pipeline :
   1. generate_data : self-play simulé, on échantillonne (état encodé du joueur courant,
      label = 1 si ce joueur gagne la partie).
-  2. ValueNet : petit MLP 138 → V(état) = proba de gagner.
+  2. ValueNet : petit MLP STATE_DIM → V(état) = proba de gagner.
   3. train : BCE, split PAR PARTIE (pas de fuite entre états corrélés).
   4. (étape suivante) brancher V comme évaluateur des feuilles du planificateur + mesurer.
 """
@@ -42,7 +42,7 @@ def generate_data(n_games: int, policies: dict, seed: int = 0,
                   sample_rate: float = 0.25, max_turns: int = 4000):
     """Joue n_games parties ; échantillonne des états (POV joueur courant), labellisés par
     l'issue. État encodé MAIN VIDE (évaluateur de position, cohérent avec une feuille de
-    plan où la main est jouée). Renvoie (X[N,138], y[N])."""
+    plan où la main est jouée). Renvoie (X[N,STATE_DIM], y[N])."""
     rng = random.Random(seed)
     X, C, G, win = [], [], [], {}
     for k in range(n_games):

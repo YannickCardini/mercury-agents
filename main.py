@@ -30,10 +30,14 @@ from aiohttp import web
 
 from mercury_legal_moves import (
     get_legal_mask, build_server_message,
-    ARRIVAL_POSITIONS,
 )
 from model import MercuryNet, encode_state_for, load_net
 from plan_hand import plan_hand_pick
+from game_state_utils import (
+    detect_winner as _detect_winner,
+    marbles_by_color as _marbles_by_color,
+    invincible_by_color as _invincible_by_color,
+)
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -60,6 +64,41 @@ THINK_MAX = float(os.environ.get("MERCURY_THINK_MAX", "8.5"))
 # le nom est récupéré depuis la réponse de /api/auth/bot.
 BOT_IDENTITIES: list[dict] = [{"botId": str(i)} for i in range(1, 28)]
 
+# Délai minimum entre deux réactions (serveur ignore les envois sous 2 s)
+REACT_COOLDOWN = 2.1
+
+# (action_type, is_own_action) → (base_probability, [(emoji, weight)])
+REACTION_ACTION_TABLE: dict[tuple[str, bool], tuple[float, list[tuple[str, int]]]] = {
+    ("enter",   True):  (1/30, [("👏", 60), ("🔥", 25), ("😎", 10), ("😂",  5)]),
+    ("enter",   False): (1/50, [("😮", 50), ("🤔", 30), ("😥", 15), ("😡",  5)]),
+    ("move",    True):  (1/90, [("🤔", 50), ("🔥", 25), ("😎", 15), ("👏", 10)]),
+    ("move",    False): (1/100, [("😴", 40), ("🥱", 35), ("🤔", 20), ("😮",  5)]),
+    ("capture", True):  (1/10, [("🔥", 50), ("😎", 25), ("👏", 15), ("😂", 10)]),
+    ("capture", False): (1/8,  [("😡", 55), ("😥", 25), ("😮", 15), ("😂",  5)]),
+    ("promote", True):  (1/12, [("😎", 50), ("👏", 25), ("🔥", 20), ("😂",  5)]),
+    ("promote", False): (1/25, [("😥", 40), ("😡", 25), ("😮", 25), ("🤔", 10)]),
+    ("discard", True):  (1/25, [("😥", 40), ("🤔", 35), ("🥱", 15), ("😴", 10)]),
+    ("discard", False): (1/50, [("😴", 40), ("🥱", 35), ("🤔", 15), ("😮", 10)]),
+    ("swap",    True):  (1/12, [("😎", 40), ("🔥", 30), ("😂", 20), ("👏", 10)]),
+    ("swap",    False): (1/10, [("🦧", 45), ("😮", 30), ("😥", 20), ("😂",  5)]),
+}
+
+# emoji reçu → (base_probability, [(emoji_réponse, weight)])
+REACTION_BROADCAST_TABLE: dict[str, tuple[float, list[tuple[str, int]]]] = {
+    "👏": (1/20, [("👏", 50), ("😂", 30), ("😎", 20)]),
+    "😂": (1/18, [("😂", 55), ("👏", 20), ("🤔", 15), ("😮", 10)]),
+    "😮": (1/25, [("😮", 50), ("😂", 25), ("🤔", 25)]),
+    "😥": (1/82, [("😥", 40), ("🤔", 35), ("😮", 25)]),
+    "🔥": (1/80, [("🔥", 50), ("😡", 30), ("😮", 20)]),
+    "🤔": (1/30, [("🤔", 60), ("😂", 25), ("😴", 15)]),
+    "😡": (1/85, [("😡", 40), ("😂", 30), ("🦧", 20), ("🥱", 10)]),
+    "😎": (1/98, [("😡", 40), ("😮", 30), ("🥱", 20), ("🤔", 10)]),
+    "😴": (1/35, [("😴", 50), ("🥱", 35), ("⏰", 15)]),
+    "⏰": (1/25, [("⏰", 45), ("😴", 30), ("🥱", 25)]),
+    "🥱": (1/30, [("🥱", 50), ("😴", 30), ("😂", 20)]),
+    "🦧": (1/20, [("🦧", 100)]),
+}
+
 
 # ── Modèle ────────────────────────────────────────────────────────────────────
 
@@ -72,7 +111,7 @@ def load_model():
             return None
         raise FileNotFoundError(f"Modèle introuvable : {MODEL_PATH}")
     try:
-        # load_net auto-détecte l'architecture (MercuryNet 138-dim courant OU MercuryNetLegacy
+        # load_net auto-détecte l'architecture (MercuryNet 143-dim courant OU MercuryNetLegacy
         # 54-dim des anciens modèles) → compatible quel que soit le modèle déployé.
         net = load_net(MODEL_PATH, map_location="cpu", eval_mode=True)
         print(f"[model] chargé depuis {MODEL_PATH} ({type(net).__name__})")
@@ -82,36 +121,6 @@ def load_model():
             print(f"[model] chargement impossible ({e!r}) — mode planificateur (sans réseau)")
             return None
         raise
-
-
-# ── Helpers d'état ────────────────────────────────────────────────────────────
-
-def _has_won(positions: list[int], color: str) -> bool:
-    return all(p in ARRIVAL_POSITIONS[color] for p in positions)
-
-
-def _detect_winner(gs: dict) -> str | None:
-    for p in gs["players"]:
-        if _has_won(p["marblePositions"], p["color"]):
-            return p["color"]
-    return None
-
-
-def _marbles_by_color(gs: dict) -> dict:
-    return {p["color"]: p["marblePositions"] for p in gs["players"]}
-
-
-def _invincible_by_color(gs: dict) -> dict:
-    """Reconstruit {color: [positions invincibles]} depuis marbleInvincible,
-    tableau parallèle à marblePositions envoyé par le serveur.
-    Indispensable pour que le masque légal d'inférence soit IDENTIQUE à celui
-    de l'entraînement (cf. bot_rl.py)."""
-    out = {}
-    for p in gs["players"]:
-        positions = p["marblePositions"]
-        inv_flags = p.get("marbleInvincible") or [False] * len(positions)
-        out[p["color"]] = [pos for pos, inv in zip(positions, inv_flags) if inv]
-    return out
 
 
 # ── Bot d'inférence ───────────────────────────────────────────────────────────
@@ -128,6 +137,7 @@ class InferenceBot:
         self.user_id: str       = self.bot_id  # ID serveur, remplacé après authenticate()
         self.color: str | None  = None
         self._resolve_warned    = False        # diag _resolve_color logué une seule fois
+        self._last_react_time: float = 0.0
 
     async def authenticate(self, client: httpx.AsyncClient) -> None:
         r = await client.post(
@@ -187,26 +197,63 @@ class InferenceBot:
             "picture":    self.picture,
         }))
 
-    async def _maybe_react(self, ws, action: dict) -> None:
-        atype = action.get("type")
-        actor = action.get("playerColor")
+    def _pick_weighted(
+        self,
+        candidates: list[tuple[str, int]],
+        base_prob: float,
+    ) -> str | None:
+        if random.random() >= base_prob:
+            return None
+        total = sum(w for _, w in candidates)
+        r = random.uniform(0, total)
+        acc = 0
+        for emoji, w in candidates:
+            acc += w
+            if acc > r:
+                return emoji
+        return candidates[-1][0]
 
-        emoji = None
-        if atype == "capture" and actor != self.color and random.random() < 1 / 15:
-            emoji = "😡"
-        elif atype == "promote" and actor == self.color and random.random() < 1 / 30:
-            emoji = "😎"
-        elif atype == "capture" and actor == self.color and random.random() < 1 / 15:
-            emoji = "🔥"
-        elif atype == "enter" and actor == self.color and random.random() < 1 / 20:
-            emoji = "👏"
-
-        if emoji:
+    async def _schedule_reaction(self, ws, emoji: str, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            now = time.monotonic()
+            if now - self._last_react_time < REACT_COOLDOWN:
+                return
             await ws.send(json.dumps({
                 "type":      "reaction",
                 "emoji":     emoji,
                 "fromColor": self.color,
             }))
+            self._last_react_time = now
+        except Exception:
+            pass
+
+    async def _maybe_react_action(self, ws, action: dict) -> None:
+        atype  = action.get("type")
+        is_own = action.get("playerColor") == self.color
+        entry  = REACTION_ACTION_TABLE.get((atype, is_own))
+        if entry is None:
+            return
+        base_prob, candidates = entry
+        emoji = self._pick_weighted(candidates, base_prob)
+        if emoji:
+            asyncio.create_task(
+                self._schedule_reaction(ws, emoji, random.uniform(1.0, 4.0))
+            )
+
+    async def _maybe_react_broadcast(self, ws, broadcast: dict) -> None:
+        if broadcast.get("author") == self.color:
+            return
+        received = broadcast.get("emoji")
+        entry = REACTION_BROADCAST_TABLE.get(received)
+        if entry is None:
+            return
+        base_prob, candidates = entry
+        emoji = self._pick_weighted(candidates, base_prob)
+        if emoji:
+            asyncio.create_task(
+                self._schedule_reaction(ws, emoji, random.uniform(1.5, 4.0))
+            )
 
     async def play_one_game(self, ws) -> None:
         await self._join(ws)
@@ -219,7 +266,12 @@ class InferenceBot:
             if mtype == "actionPlayed":
                 await ws.send(anim_done)
                 if self.color:
-                    await self._maybe_react(ws, msg.get("action", {}))
+                    await self._maybe_react_action(ws, msg.get("action", {}))
+                continue
+
+            if mtype == "reactionBroadcast":
+                if self.color:
+                    await self._maybe_react_broadcast(ws, msg)
                 continue
 
             if mtype == "gameEnded":
