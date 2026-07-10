@@ -35,6 +35,16 @@ ENTRY_BONUS          = 0.1
 # Bonus d'arrivée : 2ème plus grosse récompense après la victoire (4 arrivées = victoire).
 ARRIVAL_BONUS        = 0.3
 
+# ── Mode équipes 2v2 (teammate_color fourni à compute_reward) ─────────────────
+# Le coéquipier SORT des termes « adversaire » (son progrès perdu ne rapporte plus,
+# ses arrivées ne pénalisent plus) et son progrès devient POSITIF : l'équipe gagne
+# quand les DEUX coéquipiers finissent. Coefs à ~moitié des « own » : ma propre course
+# reste prioritaire (je ne contrôle pas ses cartes), mais capturer/faire capturer un
+# pion allié coûte (delta de progrès négatif × ce coef — y compris si c'est MOI qui
+# capture un pion allié via 7-split/atterrissage, le delta le pénalise mécaniquement).
+TEAMMATE_PROGRESS_COEF = 0.03   # progrès (±) des billes du coéquipier
+TEAMMATE_ARRIVAL_BONUS = 0.15   # bille du coéquipier entrant en zone d'arrivée
+
 # ── Calibration WIN/LOSS ──────────────────────────────────────────────────────
 # IMPORTANT — la 4ᵉ arrivée DÉCLENCHE la victoire : l'événement "arriver sa dernière
 # bille" est donc payé deux fois (ARRIVAL_BONUS au dernier flush + WIN_REWARD terminal).
@@ -76,13 +86,16 @@ def _get_marbles(game_state: dict, color: str) -> list[int]:
     return []
 
 
-def _is_threatened(my_pos: int, curr_gs: dict, my_color: str) -> bool:
-    """True si une bille adverse est à ≤ THREAT_RANGE cases derrière ma bille (sur le main path)."""
+def _is_threatened(my_pos: int, curr_gs: dict, my_color: str,
+                   teammate_color: str | None = None) -> bool:
+    """True si une bille adverse est à ≤ THREAT_RANGE cases derrière ma bille (sur le
+    main path). En 2v2, le coéquipier n'est pas une menace (il PEUT me capturer mais
+    ne le fera pas volontairement — approximation raisonnable)."""
     if my_pos not in _MAIN_PATH_IDX or my_pos in _ALL_STARTS:
         return False
     my_idx = _MAIN_PATH_IDX[my_pos]
     for color in ALL_COLORS:
-        if color == my_color:
+        if color == my_color or color == teammate_color:
             continue
         for opp_p in _get_marbles(curr_gs, color):
             if opp_p in _MAIN_PATH_IDX:
@@ -92,7 +105,8 @@ def _is_threatened(my_pos: int, curr_gs: dict, my_color: str) -> bool:
     return False
 
 
-def compute_reward(prev_gs: dict, curr_gs: dict, my_color: str) -> float:
+def compute_reward(prev_gs: dict, curr_gs: dict, my_color: str,
+                   teammate_color: str | None = None) -> float:
     """
     Récompense façonnée dense entre deux états successifs du même bot.
 
@@ -104,6 +118,11 @@ def compute_reward(prev_gs: dict, curr_gs: dict, my_color: str) -> float:
                                       : |delta_progress_adverse| × OPP_PROGRESS_COEF
       - Adversaire entrant en arrivée : − OPP_ARRIVAL_PENALTY − n_déjà × OPP_ARRIVAL_SCALE
       - Bille à moi menacée           : − THREAT_PENALTY (signal défensif pour J et 4)
+
+    2v2 (teammate_color fourni) : le coéquipier est un ALLIÉ — il sort des deux termes
+    « adversaire » ci-dessus ; son progrès (±, y compris quand JE capture un de ses
+    pions) est crédité via TEAMMATE_PROGRESS_COEF, ses arrivées via
+    TEAMMATE_ARRIVAL_BONUS, et il n'est plus compté comme menace.
     """
     reward = 0.0
 
@@ -129,12 +148,26 @@ def compute_reward(prev_gs: dict, curr_gs: dict, my_color: str) -> float:
         if prev_p not in my_arrival and curr_p in my_arrival:
             reward += ARRIVAL_BONUS
 
+    # ── Progrès du coéquipier (2v2 uniquement) : allié, signal positif dédié ──
+    if teammate_color is not None:
+        tm_arrival = ARRIVAL_POSITIONS[teammate_color]
+        prev_tm    = _get_marbles(prev_gs, teammate_color)
+        curr_tm    = _get_marbles(curr_gs, teammate_color)
+        for prev_p, curr_p in zip(prev_tm, curr_tm):
+            delta = (marble_progress(curr_p, teammate_color)
+                     - marble_progress(prev_p, teammate_color))
+            reward += delta * TEAMMATE_PROGRESS_COEF
+            if prev_p not in tm_arrival and curr_p in tm_arrival:
+                reward += TEAMMATE_ARRIVAL_BONUS
+
     # ── Progrès perdu par les adversaires (capture + swap + card-4 adverse) ──
     # En sémantique semi-MDP (du tour T au tour T+1 du même bot), ce terme
     # capture explicitement le bénéfice d'un swap au Valet (la bille adverse
     # part vers ma case de départ, souvent un gros recul).
+    # 2v2 : le coéquipier est exclu — sa perte de progrès ne rapporte RIEN
+    # (elle coûte, via TEAMMATE_PROGRESS_COEF ci-dessus).
     for color in ALL_COLORS:
-        if color == my_color:
+        if color == my_color or color == teammate_color:
             continue
         prev_opp = _get_marbles(prev_gs, color)
         curr_opp = _get_marbles(curr_gs, color)
@@ -144,8 +177,10 @@ def compute_reward(prev_gs: dict, curr_gs: dict, my_color: str) -> float:
                 reward += abs(delta) * OPP_PROGRESS_COEF
 
     # ── Adversaires entrant en zone d'arrivée ────────────────────────────────
+    # 2v2 : les arrivées du coéquipier ne sont plus pénalisées (elles sont
+    # récompensées plus haut — l'équipe gagne quand les DEUX finissent).
     for color in ALL_COLORS:
-        if color == my_color:
+        if color == my_color or color == teammate_color:
             continue
         arrival   = ARRIVAL_POSITIONS[color]
         prev_opp  = _get_marbles(prev_gs, color)
@@ -158,14 +193,21 @@ def compute_reward(prev_gs: dict, curr_gs: dict, my_color: str) -> float:
 
     # ── Menace : une bille à moi peut être capturée au prochain tour ─────────
     for curr_p in curr_mine:
-        if _is_threatened(curr_p, curr_gs, my_color):
+        if _is_threatened(curr_p, curr_gs, my_color, teammate_color):
             reward -= THREAT_PENALTY
 
     return reward
 
 
-def terminal_reward(winner_color: str | None, my_color: str) -> float:
-    """Récompense terminale à ajouter quand la partie se termine."""
-    if winner_color == my_color:
-        return WIN_REWARD
-    return LOSS_REWARD
+def terminal_reward(winners, my_color: str) -> float:
+    """Récompense terminale à ajouter quand la partie se termine.
+
+    `winners` : liste de couleurs gagnantes (nouveau protocole `gameEnded.winners` —
+    1 couleur en 1v3, les 2 couleurs de l'équipe gagnante en 2v2, [] si abandon).
+    « J'ai gagné » = my_color ∈ winners : en 2v2 les DEUX coéquipiers touchent
+    WIN_REWARD. Rétro-compat : accepte aussi une couleur seule ou None."""
+    if winners is None:
+        return LOSS_REWARD
+    if isinstance(winners, str):
+        winners = [winners]
+    return WIN_REWARD if my_color in winners else LOSS_REWARD

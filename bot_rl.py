@@ -2,9 +2,16 @@
 Bot Mercury — entraînement PPO en self-play.
 4 bots partagent le même réseau et jouent simultanément contre le serveur local.
 
-Lancer :
-  cd /home/loubard/Documents/mercury
-  python bot_rl.py
+Lancer (2v2, mode par défaut — le backend local doit être en GAME_MODE=2v2) :
+  cd /home/loubard/Documents/mercury && GAME_MODE=2v2 TRAIN_MODE=true npm start  # backend
+  GAME_MODE=2v2 python bot_rl.py
+
+Lancer (1v3 historique) :
+  GAME_MODE=1v3 python bot_rl.py   # avec le backend en GAME_MODE=1v3
+
+⚠️ Le mode décide de la tête d'action du réseau (501 vs 982) : un checkpoint model.pt
+d'un mode ne se recharge pas dans l'autre (il est sauvegardé en backup, on repart de
+zéro). En 2v2, les couleurs alliées sont red+blue vs green+orange (diagonales).
 """
 
 import asyncio, json, os, pathlib, random, shutil, threading
@@ -16,11 +23,13 @@ import httpx
 import websockets
 
 from mercury_legal_moves import (
-    get_legal_mask, build_server_message, DISCARD_IDX,
+    get_legal_mask, build_server_message,
     ARRIVAL_POSITIONS, HOME_POSITIONS, ALL_COLORS,
+    get_controlled_color, get_teammate_color,
+    ACTION_DIM, ACTION_DIM_2V2, discard_idx_for,
 )
 from game_state_utils import (
-    detect_winner as _detect_winner,
+    detect_winners as _detect_winners,
     marbles_by_color as _marbles_by_color,
     invincible_by_color as _invincible_by_color,
 )
@@ -38,6 +47,13 @@ WS_URL     = "ws://localhost:8080"
 BOT_SECRET = "change-me-before-prod"
 MODEL_PATH = pathlib.Path("model.pt")
 MODEL_DIR  = pathlib.Path("models")
+
+# Mode de jeu de l'ENTRAÎNEMENT — doit correspondre au serveur local (lancer le
+# backend avec GAME_MODE=2v2 TRAIN_MODE=true, ou GAME_MODE=1v3 pour l'historique).
+# Décide de la tête d'action du réseau (501 en 1v3, 982 layout équipe en 2v2) ;
+# gameState.gameMode reste la source de vérité par partie (vérifié en cours de jeu).
+TRAIN_GAME_MODE  = os.environ.get("GAME_MODE", "2v2")
+TRAIN_ACTION_DIM = ACTION_DIM_2V2 if TRAIN_GAME_MODE == "2v2" else ACTION_DIM
 
 GAMMA        = 0.99
 GAE_LAMBDA   = 0.95
@@ -187,7 +203,7 @@ class TrainingBuffer:
 class PPOAgent:
     def __init__(self):
         MODEL_DIR.mkdir(exist_ok=True)
-        self.net        = MercuryNet()
+        self.net        = MercuryNet(action_dim=TRAIN_ACTION_DIM)
         self.optimizer  = torch.optim.Adam(self.net.parameters(), lr=LR)
         self.buffer     = TrainingBuffer()
         self.n_updates  = 0
@@ -227,6 +243,13 @@ class PPOAgent:
         self.ref_net = load_net(REF_MODEL_PATH) if REF_MODEL_PATH.exists() else None
         if self.ref_net is None:
             print(f"[duel] {REF_MODEL_PATH} introuvable → duel désactivé")
+        elif self.ref_net.policy_head.out_features != TRAIN_ACTION_DIM:
+            # Le ref 0.82 est un modèle 1v3 (tête 501) : il ne sait pas jouer le
+            # layout 2v2 → duel désactivé tant qu'un ref 2v2 n'existe pas.
+            print(f"[duel] ref incompatible avec le mode {TRAIN_GAME_MODE} "
+                  f"(tête {self.ref_net.policy_head.out_features} ≠ {TRAIN_ACTION_DIM}) "
+                  f"→ duel désactivé")
+            self.ref_net = None
         self._load()
         self._load_best_thresholds()
 
@@ -265,26 +288,30 @@ class PPOAgent:
                 self.net.load_state_dict(ckpt)
                 print(f"Modèle chargé depuis {MODEL_PATH} (ancien format state_dict brut)")
         except RuntimeError:
-            # STATE_DIM a changé (passage au nouvel encodage par slot) → l'ancien checkpoint n'est
-            # plus chargeable. On met de côté les modèles déployables (au lieu de les
-            # supprimer) pour ne rien perdre, puis on repart de zéro.
-            backup = MODEL_PATH.with_name("model_legacy54_backup.pt")
+            # STATE_DIM ou la tête d'action a changé (nouvel encodage par slot, ou
+            # passage 1v3→2v2 : ACTION_DIM 501→982, cf. TRAIN_GAME_MODE) → l'ancien
+            # checkpoint n'est plus chargeable. On met de côté les modèles déployables
+            # (au lieu de les supprimer) pour ne rien perdre, puis on repart de zéro.
+            backup = MODEL_PATH.with_name(f"model_incompat_{TRAIN_GAME_MODE}_backup.pt")
             if not backup.exists():
                 os.replace(MODEL_PATH, backup)   # déplace model.pt → backup
-                print(f"Checkpoint incompatible (nouvel encodage) → sauvegardé dans "
-                      f"{backup}. Entraînement repart de zéro.")
+                print(f"Checkpoint incompatible (encodage ou tête d'action ≠ mode "
+                      f"{TRAIN_GAME_MODE}) → sauvegardé dans {backup}. "
+                      f"Entraînement repart de zéro.")
             else:
                 MODEL_PATH.unlink()
-                print("Checkpoint incompatible (nouvel encodage). Entraînement repart de zéro.")
+                print(f"Checkpoint incompatible (mode {TRAIN_GAME_MODE}). "
+                      f"Entraînement repart de zéro.")
             # Préserver aussi l'ancien model_best.pt (save_best l'écraserait dès le 1er duel).
-            best, best_bak = pathlib.Path("model_best.pt"), pathlib.Path("model_best_legacy54_backup.pt")
+            best     = pathlib.Path("model_best.pt")
+            best_bak = pathlib.Path(f"model_best_incompat_{TRAIN_GAME_MODE}_backup.pt")
             if best.exists() and not best_bak.exists():
                 shutil.copy2(best, best_bak)
                 print(f"Ancien model_best.pt sauvegardé dans {best_bak}.")
 
     def _save_snapshot(self):
         """Gèle une copie du réseau courant dans le pool et sur disque."""
-        snap = MercuryNet()
+        snap = MercuryNet(action_dim=TRAIN_ACTION_DIM)
         snap.load_state_dict({k: v.clone() for k, v in self.net.state_dict().items()})
         snap.eval()
         self.pool.append(snap)
@@ -460,6 +487,7 @@ class RLBot:
         self._pending   = None
         self._game_over = False  # garde anti-double-fin (gameState gagnant + gameEnded)
         self._turns     = 0      # nb de mes coups (plafonné par TRAIN_MOVE_CAP)
+        self._game_mode = TRAIN_GAME_MODE  # écrasé par gameState.gameMode (autoritatif)
         self.rollout    = RolloutBuffer()
         # Rôle tiré PAR PARTIE (self-play avec pool conservé) : chaque bot joue soit
         # le réseau courant (→ learner, accumule le gradient), soit un snapshot gelé du
@@ -487,15 +515,22 @@ class RLBot:
         self.rollout = RolloutBuffer()
 
     def _flush_pending(self, curr_gs: dict | None, done: bool,
-                       winner: str | None, next_value: float):
-        """Ajoute la transition en attente au rollout local (learner uniquement)."""
+                       winners: list | None, next_value: float):
+        """Ajoute la transition en attente au rollout local (learner uniquement).
+        `winners` : liste des couleurs gagnantes (protocole gameEnded.winners — les
+        deux coéquipiers en 2v2). En 2v2, le coéquipier est un allié pour la
+        récompense dense (compute_reward avec teammate_color)."""
         if self._pending is None:
             return
         if self.is_learner:
             p = self._pending
-            r = compute_reward(p['gs'], curr_gs, self.color) if curr_gs is not None else 0.0
+            teammate = (get_teammate_color(self.color)
+                        if self._game_mode == "2v2" else None)
+            r = (compute_reward(p['gs'], curr_gs, self.color,
+                                teammate_color=teammate)
+                 if curr_gs is not None else 0.0)
             if done:
-                r += terminal_reward(winner, self.color)
+                r += terminal_reward(winners, self.color)
             self.rollout.add(
                 p['enc'], p['mask'], p['act'], p['lp'], p['val'],
                 r, done, next_value,
@@ -529,21 +564,23 @@ class RLBot:
             "name":      self.name,
         }))
 
-    def _on_game_end(self, gs: dict | None, winner: str | None) -> bool:
+    def _on_game_end(self, gs: dict | None, winners: list | None) -> bool:
         """Fin de partie : flush la trajectoire et signale qu'il faut fermer la WS.
         On NE PEUT PAS re-join sur la même WebSocket : une fois la partie lancée,
         le MultiWsMessenger du Game capte tous les messages entrants de cette WS
         (handler permanent), et le handler initial de session (index.ts) est
         `{ once: true }` — donc un joinMatchmaking renvoyé sur la même socket
         n'atteint jamais le matchmaking. Il faut fermer puis rouvrir.
+        `winners` : gameEnded.winners (1 couleur en 1v3, l'équipe entière en 2v2,
+        [] si abandon) — « gagné » = ma couleur est dedans (mon équipe en 2v2).
         Retourne True si la fin a été traitée (→ l'appelant doit return)."""
         if self._game_over:
             return True  # déjà traité (un gameState gagnant a précédé gameEnded)
         self._game_over = True
-        self._flush_pending(curr_gs=gs, done=True, winner=winner, next_value=0.0)
+        self._flush_pending(curr_gs=gs, done=True, winners=winners, next_value=0.0)
         self._flush_rollout()
         self.agent.n_games += 1
-        won = (winner == self.color)
+        won = self.color in (winners or [])
         # Seuls les bots jouant le réseau courant (learner) comptent dans la win-rate :
         # mesurer les snapshots gelés brouillerait la métrique de progression.
         if self.is_learner:
@@ -565,7 +602,9 @@ class RLBot:
                     continue
 
                 if msg.get("type") == "gameEnded":
-                    self._on_game_end(gs=None, winner=msg.get("winner"))
+                    # BREAKING protocole : `winner` (couleur|null) n'existe plus,
+                    # `winners` est une liste (l'équipe entière en 2v2).
+                    self._on_game_end(gs=None, winners=msg.get("winners") or [])
                     return  # ferme la WS → run_bot reconnecte pour la partie suivante
 
                 if msg.get("type") != "gameState":
@@ -574,12 +613,13 @@ class RLBot:
                 gs = msg["gameState"]
                 if not self._resolve_color(gs):
                     continue  # our join isn't reflected yet
-                winner     = _detect_winner(gs)
+                self._game_mode = gs.get("gameMode", self._game_mode)
+                winners    = _detect_winners(gs)   # garde-fou local mode-aware
                 is_my_turn = gs["currentTurn"] == self.color
 
                 # ── Fin de partie détectée via gameState ────────────────────
-                if winner is not None:
-                    self._on_game_end(gs=gs, winner=winner)
+                if winners:
+                    self._on_game_end(gs=gs, winners=winners)
                     return  # ferme la WS → run_bot reconnecte pour la partie suivante
 
                 # ── Passer si ce n'est pas mon tour ─────────────────────────
@@ -590,13 +630,22 @@ class RLBot:
                 hand         = gs.get("hand", [])
                 can_discard  = gs.get("canDiscard", False)
                 mbc          = _marbles_by_color(gs)
-                my_marbles   = mbc[self.color]
                 inv_by_color = _invincible_by_color(gs)
 
+                # 2v2 : switch de fin de jeu — un bot qui a rentré ses 4 pions joue
+                # ceux du coéquipier. Tout le contexte bascule sur la couleur contrôlée.
+                if self._game_mode == "2v2":
+                    controlled = get_controlled_color(self.color, mbc[self.color])
+                    teammate   = get_teammate_color(controlled)
+                else:
+                    controlled, teammate = self.color, None
+                my_marbles = mbc[controlled]
+
                 mask, actions = get_legal_mask(
-                    hand, my_marbles, self.color, mbc,
+                    hand, my_marbles, controlled, mbc,
                     invincible_by_color=inv_by_color,
                     can_discard=can_discard,
+                    teammate_color=teammate,
                 )
                 if not any(mask):
                     continue  # ne devrait pas arriver
@@ -611,24 +660,29 @@ class RLBot:
                 # Adversaire heuristique : coup scripté, pas d'inférence réseau, pas de
                 # gradient (is_learner=False). On joue et on attend le message suivant.
                 if self.role == 'heuristic':
-                    action  = heuristic_pick(gs, self.color, mask, actions)
+                    action  = heuristic_pick(gs, controlled, mask, actions)
                     msg_out = build_server_message(
-                        action, hand, my_marbles, self.color, mbc,
+                        action, hand, my_marbles, controlled, mbc,
                         invincible_by_color=inv_by_color,
+                        teammate_color=teammate,
                     )
                     await ws.send(json.dumps(msg_out))
                     continue
 
-                state_enc               = encode_state(gs, self.color)
+                # Encodage aligné sur le masque : « moi » = la couleur CONTRÔLÉE
+                # (slots 0..3 du layout), coéquipier en position fixe (ordre 2v2).
+                state_enc               = encode_state(gs, controlled,
+                                                       teammate_color=teammate)
                 action, log_prob, value = await self._select_action(loop, state_enc, mask)
 
                 # Flush de la décision précédente avec le V(s) courant comme next_value
                 self._flush_pending(curr_gs=gs, done=False,
-                                    winner=None, next_value=value)
+                                    winners=None, next_value=value)
 
                 msg_out = build_server_message(
-                    action, hand, my_marbles, self.color, mbc,
+                    action, hand, my_marbles, controlled, mbc,
                     invincible_by_color=inv_by_color,
+                    teammate_color=teammate,
                 )
                 await ws.send(json.dumps(msg_out))
 
@@ -673,7 +727,8 @@ class EvalBot:
         self.user_id       = bot_id        # ID serveur, défini avant chaque partie par _play_isolated_game
         self.color         = None
         self._over       = False
-        self._won_color  = None          # couleur gagnante de la partie (lue après coup)
+        self._won_colors = None          # couleurs gagnantes de la partie (lues après coup)
+        self._game_mode  = TRAIN_GAME_MODE  # écrasé par gameState.gameMode
         # Diagnostic du mode d'échec (bot net d'éval uniquement). Compteurs accumulés
         # sur la partie, relus après coup par run_eval_game.
         self.collect_stats = collect_stats
@@ -697,18 +752,24 @@ class EvalBot:
             "name":      self.name,
         }))
 
-    def _pick_action(self, gs: dict, mask: list[bool], actions: list = None) -> int:
+    def _pick_action(self, gs: dict, mask: list[bool], actions: list = None,
+                     controlled: str = None, teammate: str | None = None) -> int:
+        """`controlled`/`teammate` : contexte du masque (couleur contrôlée après le
+        switch 2v2, None en 1v3) — mêmes valeurs que celles passées à get_legal_mask."""
+        controlled = controlled or self.color
         legal_idx = [i for i, ok in enumerate(mask) if ok]
         if self.mode == 'random':
             return random.choice(legal_idx)
         if self.mode == 'heuristic':
-            return heuristic_pick(gs, self.color, mask, actions)
+            return heuristic_pick(gs, controlled, mask, actions)
         if self.mode == 'plan':
-            return plan_hand_pick(gs, self.color, mask, actions)
+            return plan_hand_pick(gs, controlled, mask, actions,
+                                  teammate_color=teammate)
         # Greedy : argmax de la politique du réseau fourni (cf. main.py / prod).
         # encode_state_for route vers l'encodeur correct : le ref de duel est un modèle
-        # LEGACY (entrée 54) tandis que le réseau courant utilise l'encodage 143-dim.
-        state_enc = encode_state_for(self.net, gs, self.color)
+        # LEGACY (entrée 54) tandis que le réseau courant utilise l'encodage 143-dim
+        # (ordre « moi, coéquipier, ennemis » pour une tête 2v2).
+        state_enc = encode_state_for(self.net, gs, controlled, teammate_color=teammate)
         legal     = torch.tensor(mask, dtype=torch.bool)
         with torch.no_grad():
             with self.agent._inference_lock:  # le réseau courant peut être en cours d'update
@@ -730,13 +791,15 @@ class EvalBot:
                     self.captured += 1
         self._prev_my = list(my)
 
-    def _on_end(self, winner: str | None):
+    def _on_end(self, winners: list | None):
+        """`winners` : liste gameEnded.winners (équipe entière en 2v2, [] si abandon,
+        None si partie plafonnée/non aboutie). « Gagné » = ma couleur est dedans."""
         if self._over:
             return
         self._over = True
-        self._won_color = winner
+        self._won_colors = winners
         if self.result_sink is not None:
-            self.result_sink.append(1 if winner == self.color else 0)
+            self.result_sink.append(1 if self.color in (winners or []) else 0)
         if self.collect_stats and self._prev_my is not None:
             arrival = ARRIVAL_POSITIONS[self.color]
             self.finished = sum(1 for p in self._prev_my if p in arrival)
@@ -749,7 +812,8 @@ class EvalBot:
                 if msg.get("type") == "actionPlayed":
                     continue
                 if msg.get("type") == "gameEnded":
-                    self._on_end(msg.get("winner"))
+                    # BREAKING protocole : `winners` (liste) remplace `winner`.
+                    self._on_end(msg.get("winners") or [])
                     return
                 if msg.get("type") != "gameState":
                     continue
@@ -757,30 +821,40 @@ class EvalBot:
                 gs = msg["gameState"]
                 if not self._resolve_color(gs):
                     continue
+                self._game_mode = gs.get("gameMode", self._game_mode)
                 if self.collect_stats:
                     self._track_captures(gs)   # sur chaque état (captures aux tours adverses)
-                winner = _detect_winner(gs)
-                if winner is not None:
-                    self._on_end(winner)
+                winners = _detect_winners(gs)  # garde-fou local mode-aware
+                if winners:
+                    self._on_end(winners)
                     return
                 if gs["currentTurn"] != self.color:
                     continue
 
                 hand         = gs.get("hand", [])
                 mbc          = _marbles_by_color(gs)
-                my_marbles   = mbc[self.color]
                 inv_by_color = _invincible_by_color(gs)
+
+                # 2v2 : switch de fin de jeu (cf. RLBot.run).
+                if self._game_mode == "2v2":
+                    controlled = get_controlled_color(self.color, mbc[self.color])
+                    teammate   = get_teammate_color(controlled)
+                else:
+                    controlled, teammate = self.color, None
+                my_marbles = mbc[controlled]
+
                 mask, actions = get_legal_mask(
-                    hand, my_marbles, self.color, mbc,
+                    hand, my_marbles, controlled, mbc,
                     invincible_by_color=inv_by_color,
                     can_discard=gs.get("canDiscard", False),
+                    teammate_color=teammate,
                 )
                 if not any(mask):
                     continue
 
-                action  = self._pick_action(gs, mask, actions)
+                action  = self._pick_action(gs, mask, actions, controlled, teammate)
                 self.turns_played += 1
-                if self.collect_stats and action == DISCARD_IDX:
+                if self.collect_stats and action == discard_idx_for(teammate):
                     self.discards += 1
                 if self.turns_played >= EVAL_MOVE_CAP:
                     # Cap pour TOUS les bots (pas que collect_stats) : sinon un bot non
@@ -789,8 +863,9 @@ class EvalBot:
                     self._on_end(None)
                     return
                 msg_out = build_server_message(
-                    action, hand, my_marbles, self.color, mbc,
+                    action, hand, my_marbles, controlled, mbc,
                     invincible_by_color=inv_by_color,
+                    teammate_color=teammate,
                 )
                 await ws.send(json.dumps(msg_out))
             except Exception as e:
@@ -874,7 +949,13 @@ async def run_training():
                       f"(verrou libéré)")
 
     async def run_eval_game():
-        """Éval isolée : 1 bot greedy (réseau courant) + 3 bots aléatoires."""
+        """Éval isolée : 1 bot greedy (réseau courant) + 3 bots aléatoires.
+
+        ⚠️ Biais 2v2 : le coéquipier du net (couleur alliée, ex. blue pour red) est un
+        bot ALÉATOIRE — il « aide » l'adversaire autant que moi (il ne finit presque
+        jamais ses 4 pions, or la victoire d'équipe exige les 8). Le win-rate absolu
+        de cette métrique est donc structurellement plus bas qu'en 1v3 : comparer les
+        runs 2v2 entre eux, pas au 0.83 historique du 1v3."""
         bots = []
         net_bot = None
         for color in COLORS:
@@ -943,13 +1024,14 @@ async def run_training():
                 mode='net', net=net, result_sink=None,
             ))
         await _play_isolated_game(bots)
-        # Le gagnant est connu via le _over/color des bots : on prend le premier bot
-        # Tous les bots voient le même gagnant (stocké dans _won_color). On en déduit
-        # le camp vainqueur (courant vs ref).
-        winner_color = next((b._won_color for b in bots if b._won_color is not None), None)
-        if winner_color is None:
-            return  # partie non aboutie (déconnexion) → ne pas polluer la métrique
-        agent.duel_wins.append(1 if winner_color in DUEL_CURRENT_COLORS else 0)
+        # Tous les bots voient les mêmes gagnants (stockés dans _won_colors). On en
+        # déduit le camp vainqueur (courant vs ref). En 2v2, DUEL_CURRENT_COLORS
+        # (red+blue, en diagonale) est exactement une ÉQUIPE : le duel mesure
+        # directement équipe courante vs équipe ref.
+        won = next((b._won_colors for b in bots if b._won_colors), None)
+        if not won:
+            return  # partie non aboutie (déconnexion/abandon) → ne pas polluer la métrique
+        agent.duel_wins.append(1 if any(c in DUEL_CURRENT_COLORS for c in won) else 0)
         rate = sum(agent.duel_wins) / len(agent.duel_wins)
         agent.save_best(rate)   # capture le pic si record
         verdict = "SUPÉRIEUR ✓" if rate > DUEL_REPLACE_THRESHOLD else ""
@@ -972,10 +1054,10 @@ async def run_training():
                 collect_stats=is_plan,   # cap anti-gridlock + longueur de partie
             ))
         await _play_isolated_game(bots)
-        winner_color = next((b._won_color for b in bots if b._won_color is not None), None)
-        if winner_color is None:
+        won = next((b._won_colors for b in bots if b._won_colors), None)
+        if not won:
             return
-        agent.plan_wins.append(1 if winner_color in DUEL_CURRENT_COLORS else 0)
+        agent.plan_wins.append(1 if any(c in DUEL_CURRENT_COLORS for c in won) else 0)
         rate  = sum(agent.plan_wins) / len(agent.plan_wins)
         coups = next((b.turns_played for b in bots if b.collect_stats), 0)
         verdict = "PLAN > RÉSEAU ✓" if rate > 0.55 else ""

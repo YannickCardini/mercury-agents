@@ -31,6 +31,7 @@ from torch.distributions import Categorical
 from mercury_legal_moves import (
     HOME_POSITIONS, START_POSITIONS, ARRIVAL_POSITIONS,
     _MAIN_PATH_IDX, _MAIN_PATH_LEN, ALL_COLORS,
+    ACTION_DIM_2V2,
 )
 # Progrès d'une bille : source unique dans reward.py (aussi utilisée par plan_hand,
 # heuristic_bot). On la réutilise ici plutôt que d'en redéfinir une copie identique.
@@ -41,7 +42,9 @@ from reward import marble_progress
 STATE_DIM        = 143   # encodage courant (main par slot 5×14 + anneau partagé + flags ;
                          # 14e rang = Joker, cf. mise à jour du jeu → 138→143)
 STATE_DIM_LEGACY = 54    # ancien encodage (bitmask de rangs) — anciens modèles seulement
-ACTION_DIM       = 501   # nombre d'actions (cartes × cibles ou split-7)
+ACTION_DIM       = 501   # nombre d'actions 1v3 (cartes × cibles ou split-7)
+# ACTION_DIM_2V2 (982, importé de mercury_legal_moves) : layout 2v2 dédié (7 partagé,
+# Valet libre 16 sources, index solidaire). Le futur modèle 2v2 sort sur cette tête.
 
 # Ordre des rangs pour l'encodage de la main (one-hot par slot). 14e rang = Joker.
 _CARD_VALUES = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K', 'Joker']
@@ -90,7 +93,8 @@ def _marble_danger(pos: int, color: str, marbles_by_color: dict) -> float:
 
 # ── Encodage d'état COURANT (143 dims) ─────────────────────────────────────────
 
-def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
+def encode_state(game_state: dict, my_color: str,
+                 teammate_color: str | None = None) -> torch.Tensor:
     """Encode l'état du jeu en vecteur de STATE_DIM (143) dimensions.
 
     Structure :
@@ -102,9 +106,18 @@ def encode_state(game_state: dict, my_color: str) -> torch.Tensor:
       [119:135] flag danger des 16 billes (adversaire ≤ 12 cases derrière)
       [135:139] fraction de billes en jeu (hors home) par couleur (ma couleur d'abord)
       [139:143] fraction de billes en zone d'arrivée par couleur
+
+    teammate_color (2v2, modèle équipe) : réordonne les couleurs en
+    « moi, coéquipier, ennemi1, ennemi2 » — signal d'allié GRATUIT (position fixe
+    dans le vecteur) sans changer STATE_DIM. None = ordre historique 1v3 (moi +
+    ordre ALL_COLORS), à conserver pour les modèles déjà entraînés.
     """
     vec: list[float] = []
-    color_order      = [my_color] + [c for c in ALL_COLORS if c != my_color]
+    if teammate_color is not None:
+        color_order = ([my_color, teammate_color]
+                       + [c for c in ALL_COLORS if c not in (my_color, teammate_color)])
+    else:
+        color_order = [my_color] + [c for c in ALL_COLORS if c != my_color]
     marbles_by_color = {p['color']: p['marblePositions'] for p in game_state['players']}
 
     def marbles(color: str) -> list[int]:
@@ -209,12 +222,18 @@ def encode_state_legacy(game_state: dict, my_color: str) -> torch.Tensor:
     return feat
 
 
-def encode_state_for(net: nn.Module, game_state: dict, my_color: str) -> torch.Tensor:
+def encode_state_for(net: nn.Module, game_state: dict, my_color: str,
+                     teammate_color: str | None = None) -> torch.Tensor:
     """Route vers le bon encodeur selon la largeur d'entrée du réseau :
       - entrée 54  → encode_state_legacy (anciens modèles, ex. ref 0.82)
-      - sinon (143) → encode_state (encodage courant)."""
+      - sinon (143) → encode_state (encodage courant).
+    teammate_color n'est transmis (ordre « moi, coéquipier, ennemis ») qu'aux réseaux
+    2v2 — identifiés par leur tête de politique ACTION_DIM_2V2 : un modèle 1v3 a été
+    entraîné avec l'ordre historique et doit le garder."""
     if net.fc1.in_features == STATE_DIM_LEGACY:
         return encode_state_legacy(game_state, my_color)
+    if net.policy_head.out_features == ACTION_DIM_2V2:
+        return encode_state(game_state, my_color, teammate_color)
     return encode_state(game_state, my_color)
 
 
@@ -234,12 +253,12 @@ class _PolicyValueNet(nn.Module):
     `fc1/fc2/policy_head/value_head` (clés du state_dict) : les checkpoints existants
     restent chargeables et `load_net`/`encode_state_for` peuvent lire `fc1.in_features`."""
 
-    def __init__(self, in_features: int, hidden_dim: int):
+    def __init__(self, in_features: int, hidden_dim: int, action_dim: int = ACTION_DIM):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.fc1 = nn.Linear(in_features, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.policy_head = nn.Linear(hidden_dim, ACTION_DIM)
+        self.policy_head = nn.Linear(hidden_dim, action_dim)
         self.value_head  = nn.Linear(hidden_dim, 1)
 
     def forward(self, state: torch.Tensor, legal_mask: torch.Tensor) -> tuple:
@@ -258,10 +277,12 @@ class _PolicyValueNet(nn.Module):
 
 class MercuryNet(_PolicyValueNet):
     """Réseau PPO courant. Entrée = encodage COURANT (STATE_DIM=143). Architecture
-    identique à la version 54-dim qui convergeait — SEUL l'encodage d'entrée change."""
+    identique à la version 54-dim qui convergeait — SEUL l'encodage d'entrée change.
+    action_dim : ACTION_DIM (501, 1v3 historique) ou ACTION_DIM_2V2 (982, layout
+    équipe — le futur modèle 2v2 s'entraîne sur cette tête)."""
 
-    def __init__(self, hidden_dim: int = 384):
-        super().__init__(STATE_DIM, hidden_dim)
+    def __init__(self, hidden_dim: int = 384, action_dim: int = ACTION_DIM):
+        super().__init__(STATE_DIM, hidden_dim, action_dim)
 
 
 class MercuryNetLegacy(_PolicyValueNet):
@@ -280,11 +301,16 @@ def load_net(path, map_location="cpu", eval_mode: bool = True) -> nn.Module:
     architecture, auto-détectée par la LARGEUR D'ENTRÉE (`fc1.weight` → in_features) :
       - in_features == 54 → MercuryNetLegacy (anciens modèles, encodage legacy)
       - sinon (143)        → MercuryNet (encodage courant)
-    La largeur cachée (256/384) est lue depuis le checkpoint. Renvoie le réseau prêt."""
+    La largeur cachée (256/384) et la tête d'action (501 = 1v3, 982 = 2v2) sont lues
+    depuis le checkpoint. Renvoie le réseau prêt."""
     ckpt   = torch.load(path, weights_only=True, map_location=map_location)
     state  = ckpt['net'] if isinstance(ckpt, dict) and 'net' in ckpt else ckpt
     hidden, in_features = state['fc1.weight'].shape
-    net = MercuryNetLegacy(hidden) if in_features == STATE_DIM_LEGACY else MercuryNet(hidden)
+    action_dim = state['policy_head.weight'].shape[0]
+    if in_features == STATE_DIM_LEGACY:
+        net = MercuryNetLegacy(hidden)
+    else:
+        net = MercuryNet(hidden, action_dim=action_dim)
     net.load_state_dict(state)
     if eval_mode:
         net.eval()
