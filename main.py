@@ -30,7 +30,7 @@ from aiohttp import web
 
 from mercury_legal_moves import (
     get_legal_mask, build_server_message,
-    get_controlled_color, get_teammate_color, ACTION_DIM_2V2,
+    get_controlled_color, get_teammate_color, same_team, ACTION_DIM_2V2,
 )
 from model import MercuryNet, encode_state_for, load_net
 from plan_hand import plan_hand_pick
@@ -77,7 +77,31 @@ BOT_IDENTITIES: list[dict] = [{"botId": str(i)} for i in range(1, 28)]
 # Délai minimum entre deux réactions (serveur ignore les envois sous 2 s)
 REACT_COOLDOWN = 2.1
 
+
+def _ts() -> str:
+    """Horodatage court pour corréler les logs agent ↔ logs serveur."""
+    return time.strftime("%H:%M:%S")
+
+# ── Réactions emoji ───────────────────────────────────────────────────────────
+# La relation à l'auteur d'une action/réaction est à TROIS niveaux :
+#   'own'   → moi (playerColor == ma couleur — inchangé en 2v2 : c'est bien le
+#             joueur qui a joué la carte, même si le pion déplacé est au coéquipier)
+#   'ally'  → mon coéquipier (2v2 uniquement : red+blue vs green+orange)
+#   'enemy' → tout le reste (= tous les autres en 1v3, comportement historique)
+# Les tables historiques (own/enemy) sont INCHANGÉES ; les tables _ALLY ne sont
+# consultées qu'en 2v2. Palette = REACTION_EMOJIS du serveur (12 emojis).
+
+def _reaction_relation(my_color: str, other_color: str | None, game_mode: str) -> str:
+    """Relation emoji à l'auteur d'une action ou d'une réaction (cf. bloc ci-dessus)."""
+    if other_color == my_color:
+        return "own"
+    if game_mode == "2v2" and other_color is not None and same_team(other_color, my_color):
+        return "ally"
+    return "enemy"
+
+
 # (action_type, is_own_action) → (base_probability, [(emoji, weight)])
+# True = 'own', False = 'enemy' (l'allié 2v2 a sa table dédiée ci-dessous).
 REACTION_ACTION_TABLE: dict[tuple[str, bool], tuple[float, list[tuple[str, int]]]] = {
     ("enter",   True):  (1/30, [("👏", 60), ("🔥", 25), ("😎", 10), ("😂",  5)]),
     ("enter",   False): (1/50, [("😮", 50), ("🤔", 30), ("😥", 15), ("😡",  5)]),
@@ -93,7 +117,22 @@ REACTION_ACTION_TABLE: dict[tuple[str, bool], tuple[float, list[tuple[str, int]]
     ("swap",    False): (1/10, [("🦧", 45), ("😮", 30), ("😥", 20), ("😂",  5)]),
 }
 
+# action_type → (base_probability, [(emoji, weight)]) quand l'auteur est mon
+# COÉQUIPIER (2v2). Ses succès sont NOS succès : entrée/promotion/capture → joie
+# (👏🔥😎), jamais la tristesse/colère des tables « enemy » ; sa défausse → compassion.
+# NB : une capture alliée peut, rarement, être du friendly-fire (7 partagé) — l'action
+# diffusée ne porte pas la victime, on assume le cas courant (capture d'un ennemi).
+REACTION_ACTION_TABLE_ALLY: dict[str, tuple[float, list[tuple[str, int]]]] = {
+    "enter":   (1/35, [("👏", 55), ("🔥", 25), ("😎", 15), ("😂",  5)]),
+    "move":    (1/110, [("🤔", 40), ("👏", 25), ("😎", 20), ("🥱", 15)]),
+    "capture": (1/12, [("🔥", 50), ("👏", 25), ("😂", 15), ("😎", 10)]),
+    "promote": (1/12, [("👏", 50), ("🔥", 25), ("😎", 20), ("😂",  5)]),
+    "discard": (1/40, [("😥", 45), ("🤔", 30), ("😮", 15), ("🥱", 10)]),
+    "swap":    (1/12, [("😎", 40), ("🔥", 30), ("👏", 20), ("😂", 10)]),
+}
+
 # emoji reçu → (base_probability, [(emoji_réponse, weight)])
+# Table historique = réponses à un ADVERSAIRE (et tout le monde en 1v3).
 REACTION_BROADCAST_TABLE: dict[str, tuple[float, list[tuple[str, int]]]] = {
     "👏": (1/20, [("👏", 50), ("😂", 30), ("😎", 20)]),
     "😂": (1/18, [("😂", 55), ("👏", 20), ("🤔", 15), ("😮", 10)]),
@@ -107,6 +146,25 @@ REACTION_BROADCAST_TABLE: dict[str, tuple[float, list[tuple[str, int]]]] = {
     "⏰": (1/25, [("⏰", 45), ("😴", 30), ("🥱", 25)]),
     "🥱": (1/30, [("🥱", 50), ("😴", 30), ("😂", 20)]),
     "🦧": (1/20, [("🦧", 100)]),
+}
+
+# Réponses à l'emoji de mon COÉQUIPIER (2v2) : on fait équipe — on amplifie ses
+# 🔥/👏/😎 (au lieu de la jalousie 😡 des tables adverses), on console ses 😥/😡,
+# et on rejoint ses pitreries. Probabilités un peu plus hautes : on se répond
+# davantage entre coéquipiers qu'à des adversaires.
+REACTION_BROADCAST_TABLE_ALLY: dict[str, tuple[float, list[tuple[str, int]]]] = {
+    "👏": (1/18, [("👏", 60), ("😂", 25), ("🔥", 15)]),
+    "😂": (1/16, [("😂", 60), ("👏", 25), ("😎", 15)]),
+    "😮": (1/25, [("😮", 50), ("😂", 30), ("🤔", 20)]),
+    "😥": (1/30, [("😥", 40), ("👏", 30), ("🤔", 30)]),
+    "🔥": (1/25, [("🔥", 60), ("👏", 25), ("😎", 15)]),
+    "🤔": (1/30, [("🤔", 55), ("😂", 25), ("👏", 20)]),
+    "😡": (1/40, [("😥", 35), ("🤔", 30), ("😮", 20), ("😂", 15)]),
+    "😎": (1/40, [("👏", 40), ("🔥", 30), ("😂", 20), ("😎", 10)]),
+    "😴": (1/35, [("😂", 40), ("😴", 30), ("⏰", 30)]),
+    "⏰": (1/30, [("⏰", 45), ("😂", 30), ("😴", 25)]),
+    "🥱": (1/30, [("🥱", 40), ("😂", 35), ("😴", 25)]),
+    "🦧": (1/20, [("🦧", 60), ("😂", 40)]),
 }
 
 
@@ -258,9 +316,17 @@ class InferenceBot:
             pass
 
     async def _maybe_react_action(self, ws, action: dict) -> None:
-        atype  = action.get("type")
-        is_own = action.get("playerColor") == self.color
-        entry  = REACTION_ACTION_TABLE.get((atype, is_own))
+        atype    = action.get("type")
+        # Relation jugée sur playerColor (le joueur qui a joué la carte) — en 2v2 le
+        # pion déplacé peut appartenir au coéquipier (switch/solidaire/7 partagé),
+        # mais on réagit au JOUEUR, pas au pion. Un promote du coéquipier → joie
+        # (table ALLY), plus jamais la tristesse/colère de la table adverse.
+        relation = _reaction_relation(self.color, action.get("playerColor"),
+                                      self.game_mode)
+        if relation == "ally":
+            entry = REACTION_ACTION_TABLE_ALLY.get(atype)
+        else:
+            entry = REACTION_ACTION_TABLE.get((atype, relation == "own"))
         if entry is None:
             return
         base_prob, candidates = entry
@@ -271,10 +337,14 @@ class InferenceBot:
             )
 
     async def _maybe_react_broadcast(self, ws, broadcast: dict) -> None:
-        if broadcast.get("author") == self.color:
+        author = broadcast.get("author")
+        if author == self.color:
             return
         received = broadcast.get("emoji")
-        entry = REACTION_BROADCAST_TABLE.get(received)
+        if _reaction_relation(self.color, author, self.game_mode) == "ally":
+            entry = REACTION_BROADCAST_TABLE_ALLY.get(received)
+        else:
+            entry = REACTION_BROADCAST_TABLE.get(received)
         if entry is None:
             return
         base_prob, candidates = entry
@@ -307,7 +377,15 @@ class InferenceBot:
                 # BREAKING protocole : `winner` n'existe plus, `winners` est une liste
                 # (1 couleur en 1v3, les 2 de l'équipe en 2v2, [] si abandon). Le bot
                 # d'inférence n'exploite pas le résultat : fin de partie = on sort.
+                print(f"[{_ts()}][{self.name}] gameEnded reçu "
+                      f"(winners={msg.get('winners')}, reason={msg.get('reason')})", flush=True)
                 return
+
+            if mtype == "welcome":
+                # Confirme le seat (lancement normal ou re-seat après restart serveur).
+                print(f"[{_ts()}][{self.name}] welcome — gameId={msg.get('gameId')} "
+                      f"couleur={msg.get('myColor')}", flush=True)
+                continue
 
             if mtype != "gameState":
                 continue
@@ -322,6 +400,10 @@ class InferenceBot:
             # ses 4 pions ne termine PAS la partie (il joue ceux du coéquipier).
             # La vraie fin de partie est le message gameEnded ci-dessus.
             if _detect_winners(gs):
+                # Sortie silencieuse = tours ratés côté serveur si le garde-fou
+                # se trompe : toujours loguer pourquoi on quitte la partie.
+                print(f"[{_ts()}][{self.name}] fin détectée localement "
+                      f"(winners={_detect_winners(gs)}) — je quitte la partie", flush=True)
                 return
 
             if gs["currentTurn"] != self.color:
@@ -341,6 +423,10 @@ class InferenceBot:
             else:
                 controlled, teammate = self.color, None
 
+            print(f"[{_ts()}][{self.name}] à moi de jouer ({self.color}"
+                  f"{f', contrôle {controlled}' if controlled != self.color else ''}) "
+                  f"— main={len(hand)} cartes", flush=True)
+
             mask, actions = get_legal_mask(
                 hand, mbc[controlled], controlled, mbc,
                 invincible_by_color=inv_by_color,
@@ -348,6 +434,12 @@ class InferenceBot:
                 teammate_color=teammate,
             )
             if not any(mask):
+                # Suspect n°1 des tours ratés : si le masque local diverge du
+                # serveur (qui voit un coup légal), le bot ne répond jamais et
+                # le serveur finit par imposer un coup (timeout ~32 s).
+                print(f"[{_ts()}][{self.name}] ⚠️ aucun coup légal localement — "
+                      f"main={[c.get('value') for c in hand]} "
+                      f"canDiscard={gs.get('canDiscard')} → tour laissé au timeout serveur", flush=True)
                 continue
 
             # Sélection robuste : un plantage du sélecteur NE DOIT PAS déconnecter le bot
@@ -374,6 +466,10 @@ class InferenceBot:
                 invincible_by_color=inv_by_color,
                 teammate_color=teammate,
             )
+            compute_s = time.monotonic() - t0
+            if compute_s > 5.0:
+                print(f"[{_ts()}][{self.name}] ⚠️ sélection lente : {compute_s:.1f}s "
+                      f"(risque de timeout serveur à ~32s)", flush=True)
             # Exponential distribution clipped to [THINK_MIN, THINK_MAX]: small delays are common, large ones rare
             lam = 3.0 / (THINK_MAX - THINK_MIN)
             target = THINK_MIN + min(random.expovariate(lam), THINK_MAX - THINK_MIN)
@@ -382,6 +478,9 @@ class InferenceBot:
             # serveur). On dort le reste seulement.
             await asyncio.sleep(max(0.0, target - (time.monotonic() - t0)))
             await ws.send(json.dumps(msg_out))
+            print(f"[{_ts()}][{self.name}] coup envoyé "
+                  f"type={msg_out.get('action', {}).get('type')} "
+                  f"calcul={compute_s:.1f}s total={time.monotonic() - t0:.1f}s", flush=True)
 
 
 async def run_bot_session(net: MercuryNet, identity: dict,
