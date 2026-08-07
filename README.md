@@ -46,14 +46,16 @@ Calcule le masque des **501 actions légales** à partir de la main et des posit
 
 **Espace d'actions :** 5 emplacements de carte × 100 sous-actions + 1 défausse = 501 actions
 
-| Carte | Comportement                                                     |
-|-------|------------------------------------------------------------------|
-| K, A  | Faire entrer une marble depuis la maison                         |
-| A     | Avancer de 1 case                                                |
-| 2–Q   | Avancer de N cases                                               |
-| 4     | Reculer de 4 cases                                               |
-| 7     | Avancer de 7 (avec option de diviser entre deux marbles)         |
-| J     | Échanger une marble propre avec une marble adverse               |
+| Carte       | Comportement                                                |
+|-------------|--------------------------------------------------------------|
+| K, A, Joker | Faire entrer une marble depuis la maison                   |
+| K           | Avancer de 13 cases (si la marble est déjà en jeu)          |
+| A           | Avancer de 1 case                                            |
+| Joker       | Avancer de 18 cases                                          |
+| 2–Q         | Avancer de N cases                                           |
+| 4           | Reculer de 4 cases                                           |
+| 7           | Avancer de 7 (avec option de diviser entre deux marbles)     |
+| J           | Échanger une marble propre avec une marble adverse           |
 
 ---
 

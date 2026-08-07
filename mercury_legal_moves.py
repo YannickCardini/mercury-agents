@@ -287,13 +287,16 @@ def get_legal_action(card_value: str, marble_pos: int,
     home  = HOME_POSITIONS[color]
     start = START_POSITIONS[color]
 
-    # ── K : entrer un pion ───────────────────────────────────────────────────
+    # ── K : entrer ou avancer de 13 ───────────────────────────────────────────
     if card_value == 'K':
-        if marble_pos not in home:
-            return None
-        if start in own_marbles:
-            return None
-        return {'type': 'enter', 'from': marble_pos, 'to': start}
+        if marble_pos in home:
+            if start in own_marbles:
+                return None
+            return {'type': 'enter', 'from': marble_pos, 'to': start}
+        if is_on_main_path(marble_pos):
+            return _build_forward('K', marble_pos, 13, own_marbles, all_marbles,
+                                  color, marbles_by_color, invincible_by_color)
+        return None
 
     # ── A : entrer ou avancer de 1 ───────────────────────────────────────────
     if card_value == 'A':
@@ -665,8 +668,9 @@ def _generate_moves(hand: list, marble_positions: list[int],
 
 
 # Priorité de la carte sacrifiée pour l'entrée solidaire (port de
-# SOLIDAIRE_CARD_PRIORITY) : le Roi (pure carte d'entrée) d'abord, puis l'As,
-# le Joker en dernier recours.
+# SOLIDAIRE_CARD_PRIORITY) : le Roi d'abord, puis l'As, le Joker en dernier recours.
+# (Cette fonction ne se déclenche que main ENTIÈREMENT bloquée : l'option d'avance de
+# 13 du Roi est alors, elle aussi, nécessairement bloquée — l'ordre reste valable.)
 _SOLIDAIRE_CARD_PRIORITY = ('K', 'A', 'Joker')
 
 

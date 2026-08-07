@@ -42,6 +42,14 @@ W_CAPTURE  = 120.0   # déni accumulé par capture (× progrès de la cible)
 W_PROGRESS_TEAMMATE = 0.5 * W_PROGRESS
 W_ARRIVAL_TEAMMATE  = 0.5 * W_ARRIVAL
 
+# Préférence produit : le Roi doit privilégier faire entrer un pion ou promouvoir,
+# plutôt qu'un simple déplacement de 13 en milieu de plateau. Biais SOUPLE (pas un
+# filtre) : entrer ≈ W_PROGRESS*0.05≈5, avancer de 13 en milieu de plateau
+# ≈13/56*0.65*W_PROGRESS≈15 — le bonus fait pencher vers l'entrée dans le cas
+# générique sans jamais rivaliser avec un vrai gain de capture (W_CAPTURE=120).
+W_KING_ENTER_BONUS   = 20.0
+W_KING_PROMOTE_BONUS = 15.0   # déjà dominé par W_ARRIVAL ; renforce la consigne produit
+
 
 # ── Évaluation d'un état (mes billes) ─────────────────────────────────────────
 
@@ -124,6 +132,18 @@ def _make_score(threat_fn):
 
 _score_board   = _make_score(_threatened)   # v1 (défaut, déployé)
 score_board_v2 = _make_score(_capturable)   # v2 (menace exacte)
+
+
+def _king_pref_bonus(card_value: str, action: dict) -> float:
+    """Biais de préférence (pas de légalité) : le Roi doit privilégier entrer/promouvoir
+    sur un simple déplacement de 13 en milieu de plateau, sans jamais l'interdire."""
+    if card_value != 'K':
+        return 0.0
+    if action['type'] == 'enter':
+        return W_KING_ENTER_BONUS
+    if action['type'] == 'promote':
+        return W_KING_PROMOTE_BONUS
+    return 0.0
 
 
 # ── Application d'un de MES coups (adversaires = obstacles, capture = obstacle retiré) ──
@@ -281,9 +301,10 @@ def _search(game_state: dict, color: str, mask: list, actions: list,
         slot = _slot_of(i, hand0, e[0], per_slot)
         mp, opp, gain = _apply(my_pawns0, opp0, color, e[1], teammate=tm)
         child_hand = hand0[:slot] + hand0[slot + 1:]
+        king = _king_pref_bonus(e[0]['value'], e[1])
         node = {'my': mp, 'opp': opp, 'hand': child_hand,
-                'captured': gain, 'first_idx': i}
-        node['score'] = score_fn(mp, color, {color: mp, **opp}, gain, teammate=tm)
+                'captured': gain, 'bonus': king, 'first_idx': i}
+        node['score'] = score_fn(mp, color, {color: mp, **opp}, gain, teammate=tm) + king
         beam.append(node)
 
     if not beam:
@@ -305,16 +326,18 @@ def _search(game_state: dict, color: str, mask: list, actions: list,
             if not node['hand']:
                 continue
             mbc = {color: node['my'], **node['opp']}
-            for slot, _card, action in _legal_entries(node['hand'], node['my'],
-                                                      color, mbc, teammate=tm):
+            for slot, card, action in _legal_entries(node['hand'], node['my'],
+                                                     color, mbc, teammate=tm):
                 mp, opp, gain = _apply(node['my'], node['opp'], color, action,
                                        teammate=tm)
                 child_hand = node['hand'][:slot] + node['hand'][slot + 1:]
+                king = _king_pref_bonus(card['value'], action)
                 child = {'my': mp, 'opp': opp, 'hand': child_hand,
                          'captured': node['captured'] + gain,
+                         'bonus': node['bonus'] + king,
                          'first_idx': node['first_idx']}
                 child['score'] = score_fn(mp, color, {color: mp, **opp},
-                                          child['captured'], teammate=tm)
+                                          child['captured'], teammate=tm) + child['bonus']
                 nxt.append(child)
                 if child['score'] > best['score']:
                     best = child

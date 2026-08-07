@@ -162,6 +162,44 @@ class TestJackTeam(unittest.TestCase):
         self.assertIsNotNone(get_legal_action('Q', 10, [10], all_marbles, 'red', marbles))
 
 
+# ── Roi (K) à double usage : entrer OU avancer de 13 (changement de règle serveur) ──
+# Rappel géométrie (MAIN_PATH) : 9(start red)→10→25→...→79→80→81→66→51→36→21→6→7→8→9,
+# arrivées red = [38, 53, 68, 83].
+
+class TestKingDualUse(unittest.TestCase):
+    def test_king_still_enters_from_home(self):
+        # Non-régression : K sur un pion en réserve continue de faire entrer.
+        marbles = {**empty_by_color(), 'red': [HOME_POSITIONS['red'][0]]}
+        action = get_legal_action('K', HOME_POSITIONS['red'][0],
+                                  marbles['red'], marbles['red'], 'red', marbles)
+        self.assertEqual(action, {'type': 'enter',
+                                  'from': HOME_POSITIONS['red'][0],
+                                  'to': START_POSITIONS['red']})
+
+    def test_king_advances_13_on_board(self):
+        marbles = {**empty_by_color(), 'red': [10]}
+        action = get_legal_action('K', 10, [10], [10], 'red', marbles)
+        self.assertEqual(action, {'type': 'move', 'from': 10, 'to': 135})
+
+    def test_king_captures_at_13(self):
+        marbles = {**empty_by_color(), 'red': [10], 'blue': [135]}
+        all_marbles = [10, 135]
+        action = get_legal_action('K', 10, [10], all_marbles, 'red', marbles)
+        self.assertEqual(action, {'type': 'capture', 'from': 10, 'to': 135})
+
+    def test_king_promotes_at_13(self):
+        # Depuis 79, +13 tombe exactement sur la dernière case d'arrivée red (83).
+        marbles = {**empty_by_color(), 'red': [79]}
+        action = get_legal_action('K', 79, [79], [79], 'red', marbles)
+        self.assertEqual(action, {'type': 'promote', 'from': 79, 'to': 83})
+
+    def test_king_blocked_by_own_marble_at_destination(self):
+        marbles = {**empty_by_color(), 'red': [10, 135]}
+        all_marbles = [10, 135]
+        self.assertIsNone(get_legal_action('K', 10, [10, 135], all_marbles, 'red',
+                                           marbles))
+
+
 # ── seven-team.test.ts ────────────────────────────────────────────────────────
 # Rappels géométrie (MAIN_PATH) : 9→10→25→40→55→70→85→86→87→88→89→90→105→120…
 # et …220→219→218→217(start blue)→216… ; arrivées blue = [188,173,158,143].
@@ -267,9 +305,14 @@ class TestSevenTeam(unittest.TestCase):
 # ── solidaire.test.ts ─────────────────────────────────────────────────────────
 
 class TestSolidaire(unittest.TestCase):
-    # Main [K] bloquée pour red avec un seul pion en 10 : le K ne sait qu'entrer,
-    # et red n'a aucun pion en réserve.
-    BLOCKED_RED = {'red': [10]}
+    # Main [K] bloquée pour red avec un seul pion en 10 : le K n'est pas en réserve,
+    # et red n'a aucun pion en réserve. Depuis le changement de règle serveur, le K
+    # peut aussi avancer de 13 quand il est déjà en jeu — un pion orange INVINCIBLE
+    # une case devant (25) bloque ce nouveau déplacement (cf. BLOCKED_RED_INVINCIBLE,
+    # à passer en invincible_by_color pour les tests qui exigent une main VRAIMENT
+    # bloquée).
+    BLOCKED_RED = {'red': [10], 'orange': [25]}
+    BLOCKED_RED_INVINCIBLE = {**empty_by_color(), 'orange': [25]}
 
     def _solidaire(self, hand, color, marbles, invincible=None, teammate='auto'):
         if teammate == 'auto':
@@ -281,7 +324,8 @@ class TestSolidaire(unittest.TestCase):
     def test_forced_entry_of_teammate_marble(self):
         marbles = {**empty_by_color(), **self.BLOCKED_RED,
                    'blue': [HOME_POSITIONS['blue'][0], HOME_POSITIONS['blue'][1], 86]}
-        entry = self._solidaire([card('K')], 'red', marbles)
+        entry = self._solidaire([card('K')], 'red', marbles,
+                                invincible=self.BLOCKED_RED_INVINCIBLE)
         self.assertIsNotNone(entry)
         c, action = entry
         self.assertEqual(action['type'], 'enter')
@@ -349,13 +393,15 @@ class TestSolidaire(unittest.TestCase):
         # → timeout à chaque tour).
         marbles = {**empty_by_color(), **self.BLOCKED_RED,
                    'blue': [HOME_POSITIONS['blue'][0], HOME_POSITIONS['blue'][1], 86]}
-        mask, actions = team_mask([card('K')], 'red', marbles)
+        mask, actions = team_mask([card('K')], 'red', marbles,
+                                  invincible=self.BLOCKED_RED_INVINCIBLE)
         self.assertTrue(mask[SOLIDAIRE_IDX])
         self.assertFalse(mask[DISCARD_IDX_2V2])
         self.assertEqual(sum(mask), 1)
 
         msg = build_server_message(SOLIDAIRE_IDX, [card('K')], marbles['red'], 'red',
-                                   marbles, teammate_color='blue')
+                                   marbles, invincible_by_color=self.BLOCKED_RED_INVINCIBLE,
+                                   teammate_color='blue')
         action = msg['action']
         self.assertEqual(action['type'], 'enter')
         self.assertEqual(action['from'], HOME_POSITIONS['blue'][0])
