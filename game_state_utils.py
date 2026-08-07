@@ -1,5 +1,4 @@
-"""Helpers de lecture du gameState serveur, partagés par l'inférence (main.py) et
-l'entraînement (bot_rl.py). Auparavant dupliqués à l'identique dans les deux fichiers."""
+"""Helpers de lecture du gameState serveur, utilisés par le service d'inférence (main.py)."""
 
 from mercury_legal_moves import has_won, has_team_won, get_teammate_color
 

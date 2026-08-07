@@ -18,124 +18,25 @@ Service de bots d'IA pour le jeu Mercury. Expose une API HTTP pilotée par webho
 
 Serveur HTTP/WebSocket déployé sur Azure. Gère 27 identités de bots disponibles en parallèle pour remplir le matchmaking.
 
-**Agent joué en prod** (`MERCURY_AGENT`, défaut `plan`) :
-- `plan` (défaut) → **planificateur de main** (`plan_hand.py`) : recherche en faisceau de la
-  meilleure séquence de cartes. N'utilise PAS le réseau de neurones.
-- `net` → ancien réseau réactif (argmax greedy sur les 501 actions légales). Repli si besoin.
+**Agent joué en prod** : le **planificateur de main** (`plan_hand.py`) — recherche en faisceau de
+la meilleure séquence de cartes sur la main courante.
 
 **Cycle de vie d'une partie :**
 1. Le backend appelle `POST /dispatch` avec l'ID de partie
 2. Un bot disponible ouvre un WebSocket vers le serveur Mercury
 3. À chaque tour du bot :
-   - L'agent (planificateur ou réseau, selon `MERCURY_AGENT`) choisit une action parmi les
-     501 actions légales calculées par `mercury_legal_moves.py`
+   - Le planificateur choisit une action parmi les 501 actions légales calculées par
+     `mercury_legal_moves.py`
    - Un délai simulé (0.5–8.5 secondes) est ajouté pour imiter un joueur humain
 4. Fin de partie → bot libéré et disponible à nouveau
 
-> En production, le modèle est **figé** : aucun apprentissage n'a lieu pendant les parties. Pour améliorer le modèle, il faut entraîner via `bot_rl.py` puis redéployer.
-
 ---
 
-### `bot_rl.py` — Entraînement par reinforcement learning (offline)
+### `plan_hand.py` — Planificateur de main
 
-Script d'entraînement à lancer **localement** avec un serveur Mercury local sur `localhost:8080`. Lance 4 bots en self-play simultané pour entraîner le réseau par l'algorithme **PPO (Proximal Policy Optimization)**.
-
-**Organisation des bots :**
-- **1 bot learner (rouge)** : accumule de l'expérience et met à jour le réseau
-- **3 bots adversaires** : piochent dans un pool de snapshots passés pour diversifier les opposants
-
-**Boucle d'entraînement :**
-1. Les 4 bots jouent des parties complètes en parallèle
-2. Le learner collecte ses transitions : `(état, action, log_prob, valeur, reward)`
-3. Toutes les **512 transitions** collectées → une mise à jour PPO
-4. Tous les **25 updates** → snapshot sauvegardé dans `models/snapshot_XXXXXX.pt`
-
-**Hyperparamètres PPO :**
-
-| Paramètre        | Valeur | Rôle                                      |
-|------------------|--------|-------------------------------------------|
-| `GAMMA`          | 0.99   | Facteur de discount (importance du futur) |
-| `GAE_LAMBDA`     | 0.95   | Lissage de l'avantage (GAE)               |
-| `CLIP_EPS`       | 0.2    | Plafond du ratio de politique (stabilité) |
-| `LR`             | 3e-4   | Learning rate Adam                        |
-| `ENTROPY_COEF`   | 0.015  | Bonus d'entropie (encourage l'exploration)|
-| `VALUE_COEF`     | 0.5    | Poids de la loss du critique              |
-| `UPDATE_EVERY`   | 512    | Transitions accumulées avant update       |
-| `PPO_EPOCHS`     | 4      | Epochs de gradient par update             |
-| `BATCH_SIZE`     | 64     | Taille des mini-batches                   |
-| `POOL_SIZE`      | 18     | Nombre de snapshots adversaires conservés |
-| `SNAPSHOT_EVERY` | 25     | Fréquence de sauvegarde des snapshots     |
-
-**Lancer l'entraînement :**
-```bash
-python -m venv torch_env
-source torch_env/bin/activate
-pip install -r requirements.txt
-
-export MERCURY_API_URL=http://localhost:8080
-export MERCURY_WS_URL=ws://localhost:8080
-export MERCURY_BOT_SECRET=change-me-before-prod
-
-python bot_rl.py
-# Logs : "update 1 | p_loss=... v_loss=... ent=..."
-# Snapshots : models/snapshot_000010.pt, snapshot_000020.pt, ...
-```
-
-Après entraînement, copier le meilleur snapshot en `model.pt` et pousser sur `main` pour redéployer.
-
----
-
-### `model.py` — Réseau de neurones
-
-**Encodage de l'état (143 dimensions) :**
-
-Le plateau est une grille 15×15 (cases 0–224) dont seules **56 cases** forment l'anneau de jeu (`MAIN_PATH`), plus **8 cases par couleur** (4 HOME + 4 ARRIVAL). Les positions brutes ne sont donc pas comparables telles quelles : on encode chaque bille par son **index d'anneau partagé** (0–55, normalisé /61), repère commun à toutes les couleurs.
-
-> **Correction clé (vs l'ancien encodage 54-dim) :** la main est encodée **carte par carte** (5 slots × 13 rangs), pas comme un simple bitmask de rangs présents. L'espace d'action étant indexé **par slot de carte**, le réseau doit savoir *quelle carte occupe quel slot* pour choisir laquelle dépenser — sinon il joue le bon pion mais gâche ses cartes. L'ancien encodeur reste dans `encode_state_legacy` pour rejouer les modèles d'avant (ex. ref 0.82) en duel.
-
-| Features              | Dimensions  | Contenu                                                       |
-|-----------------------|-------------|--------------------------------------------------------------|
-| Position absolue      | [0:16]      | 16 billes (ma couleur d'abord), index d'anneau MAIN_PATH /61 |
-| Progrès relatif       | [16:32]     | Progrès 0→1 des 16 billes vers l'arrivée de leur camp        |
-| Flag protégé          | [32:48]     | 1 si la bille est sur sa case start (invulnérable)           |
-| **Main (par slot)**   | [48:118]    | **5 slots × 14 rangs one-hot — quelle carte dans quel slot (14e = Joker)** |
-| canDiscard            | [118]       | Flag booléen                                                 |
-| Flag danger           | [119:135]   | 1 si un adversaire est à ≤ 12 cases derrière la bille        |
-| Fraction en jeu       | [135:139]   | Billes hors home par couleur (normalisé /4)                  |
-| Fraction en arrivée   | [139:143]   | Billes en zone d'arrivée par couleur (normalisé /4)          |
-
-**Architecture du réseau :**
-```
-Entrée (143) → FC(384, ReLU) → FC(384, ReLU) → Policy head (501 actions)
-                                              → Value head (1 scalaire)
-```
-- Les actions illégales sont masquées (`-inf` dans le softmax) avant l'échantillonnage
-- Architecture volontairement **identique** à la version 54-dim qui convergeait : on n'a changé **qu'un seul facteur**, l'encodage d'entrée (54 → 143), pour en isoler l'effet
-
----
-
-### `reward.py` — Système de récompenses
-
-Récompenses **denses** calculées à chaque transition (pas seulement en fin de partie) pour accélérer l'apprentissage.
-
-| Récompense                  | Coefficient | Condition                                                  |
-|-----------------------------|-------------|------------------------------------------------------------|
-| Progression de ses marbles    | `+0.6`      | Marble qui avance sur le plateau (normalisé 0→1)           |
-| Entrée en jeu d'une marble    | `+1.0`      | Marble quittant la maison pour la case départ              |
-| **Arrivée d'une marble**      | `+3.0`      | Marble propre entrant en zone d'arrivée (une fois)         |
-| Recul d'une marble adverse    | `+1.0`      | Adversaire capturé, swappé ou reculé par carte 4           |
-| Arrivée d'un adversaire       | `-0.15`     | Adverse entrant en zone d'arrivée (scalé par déjà arrivés) |
-| Menace (proximité)            | `-0.05`     | Marble propre à moins de 6 cases d'un adversaire           |
-| **Victoire**                  | `+10.0`     | Terminale                                                  |
-| **Défaite**                   | `-4.0`      | Terminale                                                  |
-
-> **Calibration :** le reward de victoire (`+10.0`) reste le signal dominant. L'**arrivée d'une
-> bille** (`+3.0`) est la 2ème plus grosse récompense : faire rentrer ses billes en zone d'arrivée
-> est l'une des étapes décisives du jeu (4 billes arrivées = victoire), donc bien au-dessus de
-> l'entrée en jeu et du recul adverse (`+1.0`). Le bonus est déclenché une seule fois, au passage
-> plateau → zone d'arrivée (l'avancement dans les slots reste couvert par le progrès dense).
-> L'entrée en jeu (`+1.0`) est intentionnellement bien supérieure à l'avancement d'une case
-> (~`+0.007`), pour éviter que l'agent utilise l'As pour avancer plutôt que pour faire entrer une bille.
+Recherche en faisceau (beam search) sur les séquences de cartes jouables, replanifiée à chaque
+tour (horizon glissant). C'est l'agent de production par défaut — pur Python, aucun réseau de
+neurones impliqué.
 
 ---
 
@@ -158,12 +59,10 @@ Calcule le masque des **501 actions légales** à partir de la main et des posit
 
 ### Autres modules
 
-| Fichier             | Rôle                                                                          |
-|---------------------|-------------------------------------------------------------------------------|
-| `plan_hand.py`      | Planificateur de main (recherche en faisceau). **Agent prod par défaut.**     |
-| `heuristic_bot.py`  | Bot scripté cohérent — adversaire d'entraînement et benchmark.                |
-| `mercury_sim.py`    | Simulateur de partie local (sans serveur) — base de la R&D AlphaZero-lite.    |
-| `mercury_az.py`     | **Expérimental** : entraîne un réseau de valeur (`value_net.pt`) en self-play simulé. Script autonome, non branché sur la prod. |
+| Fichier                | Rôle                                                                                           |
+|-------------------------|-------------------------------------------------------------------------------------------------|
+| `game_state_utils.py`  | Helpers partagés sur le gameState (détection de victoire, billes par couleur, invincibilité).  |
+| `reward.py`             | `marble_progress()` — progrès normalisé d'une bille, utilisé par le scoring du planificateur.  |
 
 ---
 
@@ -183,11 +82,10 @@ Dans **Settings → Secrets and variables → Actions** du repo GitHub :
 Dans **App Service → Configuration → Application settings** :
 
 | Variable               | Description                              | Exemple                        |
-|------------------------|------------------------------------------|--------------------------------|
+|------------------------|-------------------------------------------|--------------------------------|
 | `MERCURY_API_URL`      | URL HTTP du backend                      | `https://ton-backend.azurewebsites.net` |
 | `MERCURY_WS_URL`       | URL WebSocket du backend                 | `wss://ton-backend.azurewebsites.net`   |
 | `MERCURY_BOT_SECRET`   | Secret partagé avec le backend           | (valeur secrète)               |
-| `MERCURY_MODEL_PATH`   | Chemin vers le modèle (optionnel)        | `model.pt`                     |
 
 > Le port est géré automatiquement via la variable `PORT` injectée par Azure.
 

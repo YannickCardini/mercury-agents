@@ -19,20 +19,17 @@ persistant local, healthcheck inclus.
 import asyncio
 import json
 import os
-import pathlib
 import random
 import time
 
 import httpx
-import torch
 import websockets
 from aiohttp import web
 
 from mercury_legal_moves import (
     get_legal_mask, build_server_message,
-    get_controlled_color, get_teammate_color, same_team, ACTION_DIM_2V2,
+    get_controlled_color, get_teammate_color, same_team,
 )
-from model import MercuryNet, encode_state_for, load_net
 from plan_hand import plan_hand_pick
 from game_state_utils import (
     detect_winners as _detect_winners,
@@ -46,22 +43,11 @@ from game_state_utils import (
 API_URL    = os.environ.get("MERCURY_API_URL", "http://localhost:8080")
 WS_URL     = os.environ.get("MERCURY_WS_URL",  "ws://localhost:8080")
 BOT_SECRET = os.environ.get("MERCURY_BOT_SECRET", "change-me-before-prod")
-MODEL_PATH = pathlib.Path(os.environ.get("MERCURY_MODEL_PATH", "model.pt"))
-# Modèle dédié au mode équipes (tête d'action ACTION_DIM_2V2). Tant qu'il n'est pas
-# entraîné/déployé, le 2v2 est joué par le planificateur team-aware (mode 'plan').
-MODEL_PATH_2V2 = pathlib.Path(os.environ.get("MERCURY_MODEL_PATH_2V2", "model_2v2.pt"))
 
 # Modes de jeu supportés — le backend décide (env GAME_MODE côté serveur) et l'annonce
-# via le body du dispatch (préchargement du bon modèle) puis gameState.gameMode
-# (source de vérité EN partie).
+# via le body du dispatch puis gameState.gameMode (source de vérité EN partie).
 GAME_MODES        = ("1v3", "2v2")
 DEFAULT_GAME_MODE = "2v2"   # défaut serveur
-
-# Agent joué en prod :
-#   'plan' (défaut) → planificateur de main (recherche multi-cartes, niveau humain vs random,
-#                     bat le réseau ~0.72). N'utilise PAS le réseau.
-#   'net'           → ancien réseau réactif (argmax). Repli si besoin.
-AGENT_MODE = os.environ.get("MERCURY_AGENT", "plan")
 
 LISTEN_HOST = os.environ.get("MERCURY_AGENT_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("MERCURY_AGENT_PORT", os.environ.get("PORT", "8000")))
@@ -168,53 +154,13 @@ REACTION_BROADCAST_TABLE_ALLY: dict[str, tuple[float, list[tuple[str, int]]]] = 
 }
 
 
-# ── Modèle ────────────────────────────────────────────────────────────────────
-
-def _load_one_model(path: pathlib.Path, mode: str):
-    # En mode 'plan', le réseau n'est PAS utilisé → on tolère son absence/incompatibilité
-    # (le planificateur est auto-suffisant). En mode 'net', seul le modèle 1v3 reste
-    # obligatoire : le modèle 2v2 n'existe pas encore (repli planificateur team-aware).
-    if not path.exists():
-        if AGENT_MODE == "plan" or mode == "2v2":
-            print(f"[model:{mode}] {path} absent — mode planificateur (sans réseau)")
-            return None
-        raise FileNotFoundError(f"Modèle introuvable : {path}")
-    try:
-        # load_net auto-détecte l'architecture (MercuryNet 143-dim courant OU MercuryNetLegacy
-        # 54-dim des anciens modèles, tête 501/982) → compatible quel que soit le modèle déployé.
-        net = load_net(path, map_location="cpu", eval_mode=True)
-        print(f"[model:{mode}] chargé depuis {path} ({type(net).__name__}, "
-              f"actions={net.policy_head.out_features})")
-        return net
-    except Exception as e:
-        if AGENT_MODE == "plan" or mode == "2v2":
-            print(f"[model:{mode}] chargement impossible ({e!r}) — mode planificateur (sans réseau)")
-            return None
-        raise
-
-
-def load_models() -> dict:
-    """Un modèle par mode de jeu — le dispatch annonce le mode pour précharger le bon."""
-    nets = {"1v3": _load_one_model(MODEL_PATH, "1v3"),
-            "2v2": _load_one_model(MODEL_PATH_2V2, "2v2")}
-    # Garde-fou : un modèle 2v2 doit sortir sur la tête d'action du layout 2v2.
-    net_2v2 = nets["2v2"]
-    if net_2v2 is not None and net_2v2.policy_head.out_features != ACTION_DIM_2V2:
-        print(f"[model:2v2] tête d'action {net_2v2.policy_head.out_features} ≠ "
-              f"{ACTION_DIM_2V2} — ignoré, repli planificateur team-aware")
-        nets["2v2"] = None
-    return nets
-
-
 # ── Bot d'inférence ───────────────────────────────────────────────────────────
 
 class InferenceBot:
-    """Joue une partie en utilisant le réseau gelé, action greedy (argmax) — ou le
-    planificateur de main (AGENT_MODE='plan', défaut / repli sans modèle)."""
+    """Joue une partie en utilisant le planificateur de main (plan_hand.plan_hand_pick) :
+    recherche en faisceau de la meilleure séquence de cartes sur la main courante."""
 
-    def __init__(self, net: MercuryNet, identity: dict,
-                 game_mode: str = DEFAULT_GAME_MODE):
-        self.net    = net
+    def __init__(self, identity: dict, game_mode: str = DEFAULT_GAME_MODE):
         # Hint du dispatch — écrasé par gameState.gameMode (source de vérité) en partie.
         self.game_mode = game_mode
         self.bot_id = identity["botId"]
@@ -269,12 +215,6 @@ class InferenceBot:
             print(f"[{self.name}] _resolve_color échec — self.user_id={self.user_id!r} "
                   f"self.name={self.name!r} players={summary}", flush=True)
         return False
-
-    def _select_action(self, state_enc: torch.Tensor, mask: list[bool]) -> int:
-        legal = torch.tensor(mask, dtype=torch.bool)
-        with torch.no_grad():
-            dist, _ = self.net(state_enc, legal)
-            return int(torch.argmax(dist.probs).item())
 
     async def _join(self, ws) -> None:
         await ws.send(json.dumps({
@@ -442,22 +382,13 @@ class InferenceBot:
                       f"canDiscard={gs.get('canDiscard')} → tour laissé au timeout serveur", flush=True)
                 continue
 
-            # Sélection robuste : un plantage du sélecteur NE DOIT PAS déconnecter le bot
+            # Sélection robuste : un plantage du planificateur NE DOIT PAS déconnecter le bot
             # (sinon il quitte la partie). En cas d'erreur → 1er coup légal de repli
             # (inclut l'entrée solidaire forcée, seule action du masque quand elle s'impose).
             t0 = time.monotonic()
-            # Le réseau n'est joué que si sa tête d'action correspond au layout du
-            # masque (501 en 1v3, 982 en 2v2) — protège d'un hint de dispatch erroné.
-            use_net = (AGENT_MODE == "net" and self.net is not None
-                       and self.net.policy_head.out_features == len(mask))
             try:
-                if use_net:
-                    state_enc = encode_state_for(self.net, gs, controlled,
-                                                 teammate_color=teammate)
-                    action    = self._select_action(state_enc, mask)
-                else:
-                    action = plan_hand_pick(gs, controlled, mask, actions,
-                                            teammate_color=teammate)
+                action = plan_hand_pick(gs, controlled, mask, actions,
+                                        teammate_color=teammate)
             except Exception as e:
                 print(f"[{self.name}] erreur sélection ({e!r}) → coup légal de repli", flush=True)
                 action = next(i for i, ok in enumerate(mask) if ok)
@@ -483,10 +414,10 @@ class InferenceBot:
                   f"calcul={compute_s:.1f}s total={time.monotonic() - t0:.1f}s", flush=True)
 
 
-async def run_bot_session(net: MercuryNet, identity: dict,
+async def run_bot_session(identity: dict,
                           game_mode: str = DEFAULT_GAME_MODE) -> None:
     """Cycle complet : auth → WS → 1 partie → close. Robuste aux erreurs."""
-    bot = InferenceBot(net, identity, game_mode=game_mode)
+    bot = InferenceBot(identity, game_mode=game_mode)
     print(f"connection du bot {bot.bot_id} (mode {game_mode})")
     try:
         async with httpx.AsyncClient() as client:
@@ -518,7 +449,7 @@ async def dispatch_handler(request: web.Request) -> web.Response:
         return web.json_response({"error": "unauthorized"}, status=401)
 
     # Le backend POSTe désormais {"gameMode": "1v3" | "2v2"} (avant : body {}) pour
-    # que l'agent précharge le bon modèle. Body absent/invalide → défaut serveur (2v2).
+    # indiquer le mode de la partie. Body absent/invalide → défaut serveur (2v2).
     # Ce hint est ensuite écrasé par gameState.gameMode, la source de vérité en partie.
     game_mode = DEFAULT_GAME_MODE
     try:
@@ -536,9 +467,8 @@ async def dispatch_handler(request: web.Request) -> web.Response:
         return web.json_response({"status": "busy", "active": list(active)},
                                  status=503)
 
-    net = request.app["nets"][game_mode]
     active[ident["botId"]] = {
-        "task": asyncio.create_task(run_bot_session(net, ident, game_mode)),
+        "task": asyncio.create_task(run_bot_session(ident, game_mode)),
         "gameMode": game_mode,
     }
     print(f"[dispatch] bot {ident['botId']} (mode {game_mode})")
@@ -567,7 +497,6 @@ async def status_handler(request: web.Request) -> web.Response:
 
 def make_app() -> web.Application:
     app = web.Application()
-    app["nets"]   = load_models()
     app["active"] = {}
     app.router.add_post("/dispatch", dispatch_handler)
     app.router.add_get("/health",    health_handler)

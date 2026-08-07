@@ -2,9 +2,9 @@
 Tests du mode équipes 2v2 — miroir Python des tests TS du backend :
   teams.test.ts, jack-team.test.ts, seven-team.test.ts, solidaire.test.ts
 (mêmes cas, mêmes géométries), plus les invariants du layout 2v2 et des helpers
-mode-aware (detect_winners, terminal_reward).
+mode-aware (detect_winners).
 
-Lancer : torch_env/bin/python -m unittest discover tests -v
+Lancer : python -m unittest discover tests -v
 """
 
 import pathlib
@@ -21,7 +21,6 @@ from mercury_legal_moves import (  # noqa: E402
     DISCARD_IDX_2V2, SOLIDAIRE_IDX, ACTION_DIM_2V2, ACTION_DIM,
 )
 from game_state_utils import detect_winners, detect_winner  # noqa: E402
-from reward import terminal_reward, WIN_REWARD, LOSS_REWARD  # noqa: E402
 
 
 def card(value: str, cid: str | None = None) -> dict:
@@ -394,16 +393,6 @@ class TestModeAwareHelpers(unittest.TestCase):
         gs = _gs('1v3', marbles)
         del gs['gameMode']
         self.assertEqual(detect_winners(gs), ['red'])
-
-    def test_terminal_reward_winners_list(self):
-        self.assertEqual(terminal_reward(['red', 'blue'], 'red'), WIN_REWARD)
-        self.assertEqual(terminal_reward(['red', 'blue'], 'blue'), WIN_REWARD,
-                         'les DEUX coéquipiers touchent WIN_REWARD')
-        self.assertEqual(terminal_reward(['red', 'blue'], 'green'), LOSS_REWARD)
-        self.assertEqual(terminal_reward([], 'red'), LOSS_REWARD)
-        # Rétro-compat : couleur seule ou None.
-        self.assertEqual(terminal_reward('red', 'red'), WIN_REWARD)
-        self.assertEqual(terminal_reward(None, 'red'), LOSS_REWARD)
 
 
 if __name__ == '__main__':
