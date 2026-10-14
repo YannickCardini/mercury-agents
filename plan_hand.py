@@ -21,6 +21,7 @@ from mercury_legal_moves import (
 )
 import time
 
+from game_state_utils import invincible_by_color as _invincible_by_color
 from reward import marble_progress
 
 BEAM_WIDTH   = 48    # plans gardés à chaque profondeur (élargi 24→48 : recherche + fine)
@@ -34,6 +35,10 @@ MAX_PLAN_SECONDS = 0.08
 W_PROGRESS = 100.0   # somme des progrès de mes billes
 W_ARRIVAL  = 50.0    # bonus : bille promue (en zone d'arrivée, sûre)
 W_CAPTURE  = 120.0   # déni accumulé par capture (× progrès de la cible)
+# Une capture prévue pour un de mes tours SUIVANTS est incertaine (la cible aura
+# peut-être bougé) : décotée, pour qu'une capture jouable tout de suite ne soit jamais
+# remise à plus tard au profit d'un coup sans urgence (ex. dégager un pieu).
+W_CAPTURE_LATER = 0.75
 # 2v2 : le coéquipier est un ALLIÉ. Son progrès compte dans le score de fin de plan
 # (l'équipe gagne quand les DEUX finissent), pondéré à 0.5×W_PROGRESS : ma propre
 # course reste prioritaire (je ne contrôle pas ses cartes). Capturer un pion du
@@ -49,6 +54,32 @@ W_ARRIVAL_TEAMMATE  = 0.5 * W_ARRIVAL
 # générique sans jamais rivaliser avec un vrai gain de capture (W_CAPTURE=120).
 W_KING_ENTER_BONUS   = 20.0
 W_KING_PROMOTE_BONUS = 15.0   # déjà dominé par W_ARRIVAL ; renforce la consigne produit
+# Une carte d'entrée est rare : l'As sert d'abord à faire entrer un pion. Sans ce
+# biais, le moindre malus de barrage (ci-dessous) suffirait à « brûler » l'As pour
+# avancer d'UNE case (entrer ≈ 5, avancer de 1 ≈ 1) — bien pire que gêner le coéquipier
+# un tour. Calé pour donner à l'As la même marge que le Roi (≈ 10) face au barrage.
+W_ACE_ENTER_BONUS    = 8.0
+
+# ── Barrage d'une bille invincible ────────────────────────────────────────────
+# Une bille qui vient d'entrer reste INVINCIBLE sur sa case de départ tant qu'elle n'a
+# pas bougé : personne ne peut la dépasser ni s'y poser. Elle barre donc la route aux
+# pions arrêtés juste derrière — ceux des adversaires (tant mieux)… et ceux du
+# coéquipier. Les poids valent pour un pion complètement bloqué (collé au pieu) ;
+# cf. _barrage pour la pondération par la distance.
+#   - Coéquipier simplement gêné (il a d'autres pions à jouer) : malus < marge
+#     d'entrée du Roi/de l'As → on entre quand même, mais on RETARDE l'entrée ou on
+#     DÉGAGE la bille au coup suivant.
+#   - Coéquipier coincé (tous ses pions en jeu sont derrière le pieu) : malus ×2,
+#     assez pour renoncer à l'entrée (il risquerait de défausser toute sa main).
+#   - Adversaires barrés : bonus → bloquer vaut parfois le coup, même en gênant
+#     un peu le coéquipier.
+W_BLOCK_ALLY    = 6.0
+W_BLOCK_ENEMY   = 4.0
+W_BLOCK_STUCK   = 2.0   # × si TOUS les pions en jeu de la couleur sont barrés
+# Le barrage compte deux fois : à la fin de MON tour (certain : c'est ce que les
+# autres subissent tout de suite) et en fin de plan (bille laissée sur place — plus
+# long mais spéculatif, d'où le facteur).
+W_BLOCK_END_FACTOR = 0.5
 
 
 # ── Évaluation d'un état (mes billes) ─────────────────────────────────────────
@@ -134,104 +165,151 @@ _score_board   = _make_score(_threatened)   # v1 (défaut, déployé)
 score_board_v2 = _make_score(_capturable)   # v2 (menace exacte)
 
 
-def _king_pref_bonus(card_value: str, action: dict) -> float:
+def _card_pref_bonus(card_value: str, action: dict) -> float:
     """Biais de préférence (pas de légalité) : le Roi doit privilégier entrer/promouvoir
-    sur un simple déplacement de 13 en milieu de plateau, sans jamais l'interdire."""
-    if card_value != 'K':
-        return 0.0
-    if action['type'] == 'enter':
-        return W_KING_ENTER_BONUS
-    if action['type'] == 'promote':
-        return W_KING_PROMOTE_BONUS
+    sur un simple déplacement de 13 en milieu de plateau, et l'As entrer plutôt
+    qu'avancer d'une case — sans jamais interdire l'autre usage."""
+    if card_value == 'K':
+        if action['type'] == 'enter':
+            return W_KING_ENTER_BONUS
+        if action['type'] == 'promote':
+            return W_KING_PROMOTE_BONUS
+    elif card_value == 'A' and action['type'] == 'enter':
+        return W_ACE_ENTER_BONUS
     return 0.0
+
+
+# Cartes qui avancent un pion, par distance (A, 2, 3, 5…10, Q, K : 4 exemplaires ;
+# Joker : 2). Part des cartes d'avance qu'un pion ne peut PLUS jouer quand un pieu
+# se dresse `d` cases devant lui (toute distance ≥ d est barrée).
+_FORWARD_CARDS = {1: 4, 2: 4, 3: 4, 5: 4, 6: 4, 7: 4, 8: 4, 9: 4, 10: 4, 12: 4,
+                  13: 4, 18: 2}
+_BLOCK_RANGE   = max(_FORWARD_CARDS)
+_BLOCKED_SHARE = [sum(n for dist, n in _FORWARD_CARDS.items() if dist >= d)
+                  / sum(_FORWARD_CARDS.values()) for d in range(_BLOCK_RANGE + 1)]
+
+
+def _barrage(inv: frozenset, color: str, mbc: dict, teammate: str | None) -> float:
+    """Valeur, pour mon équipe, du barrage formé par MA bille invincible (0 si je n'en
+    ai pas) : > 0 quand elle bloque surtout des adversaires, < 0 quand elle bloque
+    surtout le coéquipier. Chaque pion barré pèse la part des cartes qu'il ne peut
+    plus jouer (cf. _BLOCKED_SHARE) : collé au pieu = 1, à 10 cases ≈ 0.3."""
+    start = START_POSITIONS[color]
+    if start not in inv or start not in mbc[color]:
+        return 0.0
+    start_idx = _MAIN_PATH_IDX[start]
+    value = 0.0
+    for c, positions in mbc.items():
+        if c == color:
+            continue        # mes pions ne franchissent jamais ma case de départ
+        own_start_idx = _MAIN_PATH_IDX[START_POSITIONS[c]]
+        blocked, n_blocked, n_in_play = 0.0, 0, 0
+        for p in positions:
+            idx = _MAIN_PATH_IDX.get(p)
+            if idx is None:
+                continue
+            n_in_play += 1
+            d = (start_idx - idx) % _MAIN_PATH_LEN
+            if not 1 <= d <= _BLOCK_RANGE:
+                continue
+            # Un pion qui atteint SA case de départ avant la mienne promeut : il ne
+            # viendra jamais buter sur mon pieu.
+            if 0 < (own_start_idx - idx) % _MAIN_PATH_LEN < d:
+                continue
+            blocked   += _BLOCKED_SHARE[d]
+            n_blocked += 1
+        if not n_blocked:
+            continue
+        if n_blocked == n_in_play:
+            blocked *= W_BLOCK_STUCK
+        value += -W_BLOCK_ALLY * blocked if c == teammate else W_BLOCK_ENEMY * blocked
+    return value
 
 
 # ── Application d'un de MES coups (adversaires = obstacles, capture = obstacle retiré) ──
 
 def _apply(my_pawns: list, opp: dict, color: str, action: dict,
-           teammate: str | None = None) -> tuple:
-    """Retourne (new_my_pawns, new_opp, capture_gain). `opp` = {color: [positions]}
-    (toutes les couleurs ≠ la mienne, coéquipier inclus en 2v2).
-    Réutilise les from/to/type déjà calculés par mercury_legal_moves.
+           teammate: str | None = None, inv: frozenset = frozenset()) -> tuple:
+    """Retourne (new_my_pawns, new_opp, capture_gain, new_inv). `opp` = {color:
+    [positions]} (toutes les couleurs ≠ la mienne, coéquipier inclus en 2v2) ; `inv` =
+    cases occupées par une bille invincible (toutes couleurs).
+    Réutilise les from/to/type déjà calculés par mercury_legal_moves, et applique le
+    coup comme Game.updateMarblePositions côté serveur :
+      - le pion déplacé est celui de la couleur portée par l'action (marbleColor /
+        splitMarbleColor : coéquipier pour l'entrée solidaire ou le 2e pion d'un 7
+        partagé), à défaut la mienne ;
+      - les DEUX moitiés d'un 7 bougent avant toute capture (le 1er pion peut s'arrêter
+        sur la case que le 2e quitte dans le même coup) ;
+      - tout pion posé sur une case d'arrivée du coup est renvoyé au home, quel que
+        soit le type de l'action (entrer sur un pion posé sur MA case de départ le
+        capture) et quelle que soit sa couleur — pas d'immunité d'équipe.
+    Seule la capture d'un pion ENNEMI est créditée W_CAPTURE : celle d'un pion du
+    coéquipier (ou d'un des miens) coûte via le score de fin de plan, qui perd son
+    progrès."""
+    mp    = list(my_pawns)
+    opp   = {c: list(v) for c, v in opp.items()}
+    board = {color: mp, **opp}
+    gain  = 0.0
 
-    2v2 : les pions déplacés peuvent appartenir au coéquipier (entrée solidaire,
-    2e pion d'un 7 partagé) voire à personne de mon équipe (J libre) → résolution
-    GÉNÉRIQUE du propriétaire par position. Capturer un pion du coéquipier n'est
-    PAS crédité W_CAPTURE (le score de fin de plan perd son progrès → malus) ; idem
-    pour un de MES pions (2e demi-coup d'un 7 atterrissant sur le 1er camp)."""
-    mp  = list(my_pawns)
-    opp = {c: list(v) for c, v in opp.items()}
-    gain = 0.0
+    def find(pos, owner=None):
+        """(couleur, index) du pion posé en `pos` — chez `owner` d'abord s'il est donné."""
+        if owner in board and pos in board[owner]:
+            return owner, board[owner].index(pos)
+        for c, v in board.items():
+            if pos in v:
+                return c, v.index(pos)
+        return None
 
-    def move_pawn(frm, to):
-        """Déplace le pion posé en `frm`, où qu'il soit (moi d'abord, puis les autres)."""
-        for i, p in enumerate(mp):
-            if p == frm:
-                mp[i] = to
-                return
-        for v in opp.values():
-            for i, p in enumerate(v):
-                if p == frm:
-                    v[i] = to
-                    return
-
-    def remove_victim(pos):
-        """Renvoie au home le pion capturé en `pos`. Crédit W_CAPTURE seulement si
-        c'est un pion ENNEMI — un allié (coéquipier ou moi-même) coûte via le score."""
+    def send_victims_home(pos, mover):
         nonlocal gain
-        for i, p in enumerate(mp):
-            if p == pos:
-                free = next((h for h in HOME_POSITIONS[color] if h not in mp),
-                            HOME_POSITIONS[color][0])
-                mp[i] = free
-                return
-        for c, v in opp.items():
+        for c, v in board.items():
+            if pos not in v:
+                continue
             for i, p in enumerate(v):
-                if p == pos:
-                    if teammate is None or c != teammate:
-                        gain += W_CAPTURE * marble_progress(pos, c)
-                    v[i] = HOME_POSITIONS[c][0]   # renvoyée au home → plus un obstacle
-                    return
+                if p != pos or (c, i) == mover:
+                    continue
+                home = next((h for h in HOME_POSITIONS[c] if h not in v), None)
+                if home is None:
+                    continue
+                if c != color and c != teammate:
+                    gain += W_CAPTURE * marble_progress(pos, c)
+                v[i] = home
 
-    t = action['type']
-
-    if t == 'swap':
-        # pion source (from) ↔ pion cible (to) : positions échangées.
+    if action['type'] == 'swap':
+        # pion source (from) ↔ pion cible (to) : positions échangées, où que soient
+        # les deux pions (Valet libre en 2v2 : la source peut être au coéquipier ou
+        # à un adversaire, tant qu'un des deux pions est de mon équipe).
         # On NE récompense PAS le recul infligé à l'adversaire : le J ne doit servir
         # QUE la course de l'ÉQUIPE. Le gain réel (mon pion ou celui du coéquipier
-        # saute vers `to`, un ennemi menaçant s'éloigne de derrière nos billes) est
-        # déjà capté par W_PROGRESS/W_PROGRESS_TEAMMATE et par threat_fn dans le
-        # score de fin de plan → pas de « spite swaps ». En 2v2 la source peut être
-        # n'importe quel pion (J libre, y compris ennemi↔ennemi défensif).
-        owner = None                      # occupant de `to` chez les AUTRES couleurs
-        for c, v in opp.items():
-            for i, p in enumerate(v):
-                if p == action['to']:
-                    owner = (c, i)
-                    break
-        to_was_mine = owner is None and action['to'] in mp
-        move_pawn(action['from'], action['to'])
-        if owner is not None:
-            c, i = owner
-            opp[c][i] = action['from']   # l'autre extrémité recule/avance, non récompensé
-        elif to_was_mine:
-            # Cible = un de MES pions (source étrangère, J libre 2v2) : move_pawn a
-            # déplacé la source vers `to`, mon pion prend la place laissée en `from`.
-            for i, p in enumerate(mp):
-                if p == action['to']:
-                    mp[i] = action['from']
-                    break
-        return mp, opp, gain
+        # saute vers l'avant, un ennemi menaçant s'éloigne de derrière nos billes)
+        # est déjà capté par W_PROGRESS/W_PROGRESS_TEAMMATE et par threat_fn dans le
+        # score de fin de plan → pas de « spite swaps ».
+        src, tgt = find(action['from']), find(action['to'])
+        if src and tgt:
+            board[src[0]][src[1]] = action['to']
+            board[tgt[0]][tgt[1]] = action['from']
+        return mp, opp, gain, inv - {action['from'], action['to']}
 
     # move / capture / promote / enter (+ 7-split : 2e demi-coup)
-    if t == 'capture':
-        remove_victim(action['to'])
-    move_pawn(action['from'], action['to'])
+    owner = action.get('marbleColor', color)
+    mover = find(action['from'], owner)
+    if mover:
+        board[mover[0]][mover[1]] = action['to']
+    inv = inv - {action['from']}
+    if action['type'] == 'enter':
+        inv = inv | {action['to']}      # invincible jusqu'à son premier mouvement
+
+    split = None
     if 'splitTo' in action:
-        if action.get('splitType') == 'capture':
-            remove_victim(action['splitTo'])
-        move_pawn(action['splitFrom'], action['splitTo'])
-    return mp, opp, gain
+        split = find(action['splitFrom'], action.get('splitMarbleColor', owner))
+        if split:
+            board[split[0]][split[1]] = action['splitTo']
+        inv = inv - {action['splitFrom']}
+
+    send_victims_home(action['to'], mover)
+    if split:
+        send_victims_home(action['splitTo'], split)
+    return mp, opp, gain, inv
 
 
 # ── Recherche en faisceau sur la main ─────────────────────────────────────────
@@ -251,13 +329,16 @@ def _slot_of(idx: int, hand: list, card: dict, per_slot: int) -> int:
 
 
 def _legal_entries(hand: list, my_pawns: list, color: str, mbc: dict,
-                   teammate: str | None = None) -> list:
-    """(slot, card, action_dict) légaux pour la main restante (adversaires fixes, pas
-    d'invincibilité simulée → planification optimiste sur les coups profonds).
+                   teammate: str | None = None, inv: frozenset = frozenset()) -> list:
+    """(slot, card, action_dict) légaux pour la main restante (adversaires fixes).
+    Seule l'invincibilité de MES billes est simulée (je décide quand elles bougent :
+    ni 4 ni J tant qu'elles n'ont pas avancé) ; celle des autres est ignorée, ils
+    auront bougé d'ici là → planification optimiste sur les coups profonds.
     Inclut l'entrée solidaire (2v2) — forcée par le serveur quand elle s'impose."""
     mask, actions = get_legal_mask(hand, my_pawns, color, mbc,
-                                   invincible_by_color=None, can_discard=False,
-                                   teammate_color=teammate)
+                                   invincible_by_color={
+                                       color: [p for p in my_pawns if p in inv]},
+                                   can_discard=False, teammate_color=teammate)
     per_slot = per_slot_for(teammate)
     out = []
     for j, ok in enumerate(mask):
@@ -289,6 +370,39 @@ def _search(game_state: dict, color: str, mask: list, actions: list,
     my_pawns0 = mbc0[color]
     opp0      = {c: v for c, v in mbc0.items() if c != color}
     hand0     = game_state.get('hand', [])
+    inv0      = frozenset(p for positions in _invincible_by_color(game_state).values()
+                          for p in positions)
+
+    def board_of(my_pawns, opp):
+        """{couleur: positions} dans l'ordre des joueurs du serveur (le validateur
+        résout le propriétaire d'une case en parcourant les couleurs dans cet ordre)."""
+        return {c: my_pawns if c == color else opp[c] for c in mbc0}
+
+    def make_node(parent, card, action, child_hand, first_idx):
+        """Nœud obtenu en jouant `card`/`action` depuis `parent` (None = racine)."""
+        if parent is None:
+            parent = {'my': my_pawns0, 'opp': opp0, 'inv': inv0, 'captured': 0.0,
+                      'bonus': 0.0, 'turn_block': None}
+        mp, opp, gain, inv = _apply(parent['my'], parent['opp'], color, action,
+                                    teammate=tm, inv=parent['inv'])
+        if parent['turn_block'] is not None:      # coup d'un tour suivant
+            gain *= W_CAPTURE_LATER
+        mbc     = board_of(mp, opp)
+        barrage = _barrage(inv, color, mbc, tm)
+        # Barrage subi par les autres à la fin de MON tour : figé dès que le tour se
+        # termine, encore ouvert (None) tant qu'un Joker me fait rejouer.
+        turn_block = parent['turn_block']
+        if turn_block is None and not (card['value'] == 'Joker' and child_hand):
+            turn_block = barrage
+        node = {'my': mp, 'opp': opp, 'inv': inv, 'hand': child_hand,
+                'captured': parent['captured'] + gain,
+                'bonus': parent['bonus'] + _card_pref_bonus(card['value'], action),
+                'turn_block': turn_block, 'first_idx': first_idx}
+        node['score'] = (score_fn(mp, color, mbc, node['captured'], teammate=tm)
+                         + node['bonus']
+                         + (barrage if turn_block is None else turn_block)
+                         + W_BLOCK_END_FACTOR * barrage)
+        return node
 
     # ── Racine : on étend les actions FOURNIES (vraie invincibilité / can_discard) ──
     beam = []
@@ -299,13 +413,7 @@ def _search(game_state: dict, color: str, mask: list, actions: list,
         if e is None or e == 'discard':
             continue
         slot = _slot_of(i, hand0, e[0], per_slot)
-        mp, opp, gain = _apply(my_pawns0, opp0, color, e[1], teammate=tm)
-        child_hand = hand0[:slot] + hand0[slot + 1:]
-        king = _king_pref_bonus(e[0]['value'], e[1])
-        node = {'my': mp, 'opp': opp, 'hand': child_hand,
-                'captured': gain, 'bonus': king, 'first_idx': i}
-        node['score'] = score_fn(mp, color, {color: mp, **opp}, gain, teammate=tm) + king
-        beam.append(node)
+        beam.append(make_node(None, e[0], e[1], hand0[:slot] + hand0[slot + 1:], i))
 
     if not beam:
         return [] if topk else None
@@ -325,19 +433,13 @@ def _search(game_state: dict, color: str, mask: list, actions: list,
                 break
             if not node['hand']:
                 continue
-            mbc = {color: node['my'], **node['opp']}
+            mbc = board_of(node['my'], node['opp'])
             for slot, card, action in _legal_entries(node['hand'], node['my'],
-                                                     color, mbc, teammate=tm):
-                mp, opp, gain = _apply(node['my'], node['opp'], color, action,
-                                       teammate=tm)
-                child_hand = node['hand'][:slot] + node['hand'][slot + 1:]
-                king = _king_pref_bonus(card['value'], action)
-                child = {'my': mp, 'opp': opp, 'hand': child_hand,
-                         'captured': node['captured'] + gain,
-                         'bonus': node['bonus'] + king,
-                         'first_idx': node['first_idx']}
-                child['score'] = score_fn(mp, color, {color: mp, **opp},
-                                          child['captured'], teammate=tm) + child['bonus']
+                                                     color, mbc, teammate=tm,
+                                                     inv=node['inv']):
+                child = make_node(node, card, action,
+                                  node['hand'][:slot] + node['hand'][slot + 1:],
+                                  node['first_idx'])
                 nxt.append(child)
                 if child['score'] > best['score']:
                     best = child

@@ -104,3 +104,16 @@ source torch_env/bin/activate
 pip install -r requirements.txt
 MERCURY_BOT_SECRET=secret python main.py
 ```
+
+## Tests
+
+```bash
+python -m unittest discover tests          # tests unitaires (règles, planificateur, boucle de tour)
+python tests/diff_vs_ts_validator.py 3000  # port Python vs move-validator.ts du jeu (~/Documents/mercury)
+```
+
+Le test différentiel exécute le vrai validateur TypeScript (fonctions pures, sans backend
+ni base) sur des positions aléatoires : chaque coup que le bot peut envoyer doit être
+accepté par le serveur, et chaque coup légal côté serveur doit exister dans le masque.
+À relancer après toute évolution des règles côté jeu — un écart se traduit en partie par
+un `actionRejected`.

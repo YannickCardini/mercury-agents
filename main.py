@@ -63,6 +63,20 @@ BOT_IDENTITIES: list[dict] = [{"botId": str(i)} for i in range(1, 28)]
 # Délai minimum entre deux réactions (serveur ignore les envois sous 2 s)
 REACT_COOLDOWN = 2.1
 
+# Temps de réaction avant d'envoyer un emoji, en secondes : (min, max, le plus
+# fréquent) d'un tirage triangulaire — souvent proche du mode, parfois plus long.
+# Après une ACTION, les joueurs ne voient le résultat qu'une fois la carte posée
+# (~1,6 s) et le pion déplacé : on laisse d'abord passer l'animation.
+REACT_ACTION_DELAY = (4.0, 10.0, 5.5)
+# En réponse à un EMOJI (affiché tout de suite) : le temps de le lire et de répondre.
+REACT_REPLY_DELAY  = (2.5, 7.0, 3.5)
+
+# Coups tentés au maximum dans un même tour. Quand le serveur refuse un coup
+# (actionRejected), le tour reste ouvert : on rejoue aussitôt le meilleur coup
+# restant au lieu de laisser filer les 60 s du tour. Au-delà, on demande au serveur
+# d'imposer son coup tout de suite (cf. InferenceBot._give_up_turn).
+MAX_ATTEMPTS_PER_TURN = 4
+
 
 def _ts() -> str:
     """Horodatage court pour corréler les logs agent ↔ logs serveur."""
@@ -171,6 +185,10 @@ class InferenceBot:
         self.color: str | None  = None
         self._resolve_warned    = False        # diag _resolve_color logué une seule fois
         self._last_react_time: float = 0.0
+        # Mon tour en cours : {"gs", "rejected" (index refusés par le serveur),
+        # "sent" / "sent_msg" (index et message du dernier coup envoyé)}. None hors
+        # de mon tour.
+        self._turn: dict | None = None
 
     async def authenticate(self, client: httpx.AsyncClient) -> None:
         r = await client.post(
@@ -273,7 +291,7 @@ class InferenceBot:
         emoji = self._pick_weighted(candidates, base_prob)
         if emoji:
             asyncio.create_task(
-                self._schedule_reaction(ws, emoji, random.uniform(1.0, 4.0))
+                self._schedule_reaction(ws, emoji, random.triangular(*REACT_ACTION_DELAY))
             )
 
     async def _maybe_react_broadcast(self, ws, broadcast: dict) -> None:
@@ -291,7 +309,7 @@ class InferenceBot:
         emoji = self._pick_weighted(candidates, base_prob)
         if emoji:
             asyncio.create_task(
-                self._schedule_reaction(ws, emoji, random.uniform(1.5, 4.0))
+                self._schedule_reaction(ws, emoji, random.triangular(*REACT_REPLY_DELAY))
             )
 
     async def play_one_game(self, ws) -> None:
@@ -327,6 +345,10 @@ class InferenceBot:
                       f"couleur={msg.get('myColor')}", flush=True)
                 continue
 
+            if mtype == "actionRejected":
+                await self._on_action_rejected(ws, msg)
+                continue
+
             if mtype != "gameState":
                 continue
 
@@ -347,60 +369,80 @@ class InferenceBot:
                 return
 
             if gs["currentTurn"] != self.color:
+                self._turn = None
+                continue
+            if not gs.get("hand"):
+                self._turn = None
+                continue    # main vide : le serveur passe mon tour tout seul
+            # « Connection update » rediffuse le tour EN COURS (un joueur s'est
+            # (dé)connecté), ce n'est pas un nouveau tour : si j'y ai déjà répondu,
+            # ne pas rejouer à partir de cet état, périmé dès que mon coup est appliqué.
+            if msg.get("message") == "Connection update" and self._turn is not None:
                 continue
 
-            hand = gs.get("hand", [])
-            mbc  = _marbles_by_color(gs)
-            inv_by_color = _invincible_by_color(gs)
+            self._turn = {"gs": gs, "rejected": set(), "sent": None}
+            await self._play_turn(ws, think=True)
 
-            # 2v2 — « switch » de fin de jeu : quand j'ai rentré mes 4 pions, mes
-            # cartes contrôlent les pions du coéquipier. Tout le contexte (couleur,
-            # positions, règles d'équipe) bascule sur la couleur contrôlée, comme
-            # buildLegalMoveContext côté serveur. En 1v3 : controlled = ma couleur.
-            if self.game_mode == "2v2":
-                controlled = get_controlled_color(self.color, mbc[self.color])
-                teammate   = get_teammate_color(controlled)
-            else:
-                controlled, teammate = self.color, None
+    async def _play_turn(self, ws, think: bool) -> None:
+        """Choisit et envoie un coup pour le tour en cours (self._turn), en écartant
+        les coups déjà refusés par le serveur pendant ce tour. `think` : simuler le
+        temps de réflexion d'un humain (1re tentative seulement)."""
+        turn = self._turn
+        gs   = turn["gs"]
+        hand = gs["hand"]
+        mbc  = _marbles_by_color(gs)
+        inv_by_color = _invincible_by_color(gs)
 
+        # 2v2 — « switch » de fin de jeu : quand j'ai rentré mes 4 pions, mes
+        # cartes contrôlent les pions du coéquipier. Tout le contexte (couleur,
+        # positions, règles d'équipe) bascule sur la couleur contrôlée, comme
+        # buildLegalMoveContext côté serveur. En 1v3 : controlled = ma couleur.
+        if self.game_mode == "2v2":
+            controlled = get_controlled_color(self.color, mbc[self.color])
+            teammate   = get_teammate_color(controlled)
+        else:
+            controlled, teammate = self.color, None
+
+        if not turn["rejected"]:
             print(f"[{_ts()}][{self.name}] à moi de jouer ({self.color}"
                   f"{f', contrôle {controlled}' if controlled != self.color else ''}) "
                   f"— main={len(hand)} cartes", flush=True)
 
-            mask, actions = get_legal_mask(
-                hand, mbc[controlled], controlled, mbc,
-                invincible_by_color=inv_by_color,
-                can_discard=gs.get("canDiscard", False),
-                teammate_color=teammate,
-            )
-            if not any(mask):
-                # Suspect n°1 des tours ratés : si le masque local diverge du
-                # serveur (qui voit un coup légal), le bot ne répond jamais et
-                # le serveur finit par imposer un coup (timeout ~32 s).
-                print(f"[{_ts()}][{self.name}] ⚠️ aucun coup légal localement — "
-                      f"main={[c.get('value') for c in hand]} "
-                      f"canDiscard={gs.get('canDiscard')} → tour laissé au timeout serveur", flush=True)
-                continue
+        mask, actions = get_legal_mask(
+            hand, mbc[controlled], controlled, mbc,
+            invincible_by_color=inv_by_color,
+            can_discard=gs.get("canDiscard", False),
+            teammate_color=teammate,
+        )
+        for idx in turn["rejected"]:
+            mask[idx] = False
+        if not any(mask) or len(turn["rejected"]) >= MAX_ATTEMPTS_PER_TURN:
+            await self._give_up_turn(ws)
+            return
 
-            # Sélection robuste : un plantage du planificateur NE DOIT PAS déconnecter le bot
-            # (sinon il quitte la partie). En cas d'erreur → 1er coup légal de repli
-            # (inclut l'entrée solidaire forcée, seule action du masque quand elle s'impose).
-            t0 = time.monotonic()
-            try:
-                action = plan_hand_pick(gs, controlled, mask, actions,
-                                        teammate_color=teammate)
-            except Exception as e:
-                print(f"[{self.name}] erreur sélection ({e!r}) → coup légal de repli", flush=True)
-                action = next(i for i, ok in enumerate(mask) if ok)
-            msg_out   = build_server_message(
-                action, hand, mbc[controlled], controlled, mbc,
-                invincible_by_color=inv_by_color,
-                teammate_color=teammate,
-            )
-            compute_s = time.monotonic() - t0
-            if compute_s > 5.0:
-                print(f"[{_ts()}][{self.name}] ⚠️ sélection lente : {compute_s:.1f}s "
-                      f"(risque de timeout serveur à ~32s)", flush=True)
+        # Sélection robuste : un plantage du planificateur NE DOIT PAS déconnecter le bot
+        # (sinon il quitte la partie). En cas d'erreur → 1er coup légal de repli
+        # (inclut l'entrée solidaire forcée, seule action du masque quand elle s'impose).
+        t0 = time.monotonic()
+        try:
+            action = plan_hand_pick(gs, controlled, mask, actions,
+                                    teammate_color=teammate)
+        except Exception as e:
+            print(f"[{self.name}] erreur sélection ({e!r}) → coup légal de repli", flush=True)
+            action = None
+        if action is None or not mask[action]:
+            action = next(i for i, ok in enumerate(mask) if ok)
+        msg_out   = build_server_message(
+            action, hand, mbc[controlled], controlled, mbc,
+            invincible_by_color=inv_by_color,
+            teammate_color=teammate,
+            legal=(mask, actions),
+        )
+        compute_s = time.monotonic() - t0
+        if compute_s > 5.0:
+            print(f"[{_ts()}][{self.name}] ⚠️ sélection lente : {compute_s:.1f}s "
+                  f"(risque de timeout serveur à ~65s)", flush=True)
+        if think:
             # Exponential distribution clipped to [THINK_MIN, THINK_MAX]: small delays are common, large ones rare
             lam = 3.0 / (THINK_MAX - THINK_MIN)
             target = THINK_MIN + min(random.expovariate(lam), THINK_MAX - THINK_MIN)
@@ -408,10 +450,45 @@ class InferenceBot:
             # délai (avant, calcul + delay s'additionnaient → risque de dépasser le timeout
             # serveur). On dort le reste seulement.
             await asyncio.sleep(max(0.0, target - (time.monotonic() - t0)))
-            await ws.send(json.dumps(msg_out))
-            print(f"[{_ts()}][{self.name}] coup envoyé "
-                  f"type={msg_out.get('action', {}).get('type')} "
-                  f"calcul={compute_s:.1f}s total={time.monotonic() - t0:.1f}s", flush=True)
+        turn["sent"] = action
+        turn["sent_msg"] = msg_out
+        await ws.send(json.dumps(msg_out))
+        print(f"[{_ts()}][{self.name}] coup envoyé "
+              f"type={msg_out.get('action', {}).get('type')} "
+              f"calcul={compute_s:.1f}s total={time.monotonic() - t0:.1f}s", flush=True)
+
+    async def _on_action_rejected(self, ws, msg: dict) -> None:
+        """Le serveur a refusé mon coup. Le tour reste ouvert côté serveur : sans
+        nouvelle tentative, il attend la fin du timer (60 s) avant d'imposer un coup.
+        On écarte le coup refusé et on rejoue aussitôt le meilleur coup restant."""
+        turn = self._turn
+        reason = msg.get("reason")
+        if turn is None or turn["sent"] is None or reason == "Not your turn":
+            print(f"[{_ts()}][{self.name}] actionRejected ignoré (reason={reason!r})",
+                  flush=True)
+            return
+        # Un rejet = le masque local diverge du validateur serveur : on logue de quoi
+        # rejouer la position hors ligne (tests/diff_vs_ts_validator.py).
+        gs, sent = turn["gs"], turn["sent_msg"]["action"]
+        print(f"[{_ts()}][{self.name}] ⚠️ actionRejected (reason={reason!r}) "
+              f"coup={json.dumps({k: sent.get(k) for k in ('type', 'from', 'to', 'splitFrom')})} "
+              f"carte={[c.get('value') for c in sent.get('cardPlayed', [])]} "
+              f"main={[c.get('value') for c in gs['hand']]} "
+              f"canDiscard={gs.get('canDiscard')} "
+              f"pions={json.dumps(_marbles_by_color(gs))} "
+              f"invincibles={json.dumps(_invincible_by_color(gs))}", flush=True)
+        turn["rejected"].add(turn["sent"])
+        turn["sent"] = None
+        await self._play_turn(ws, think=False)
+
+    async def _give_up_turn(self, ws) -> None:
+        """Plus aucun coup à tenter : `turnTimeout` (le message qu'envoie le front à la
+        fin de son timer) fait imposer par le serveur SON coup légal immédiatement,
+        au lieu de bloquer la table jusqu'à la fin du tour."""
+        print(f"[{_ts()}][{self.name}] ⚠️ aucun coup accepté par le serveur "
+              f"({len(self._turn['rejected'])} refus) → turnTimeout, coup imposé", flush=True)
+        self._turn["sent"] = None
+        await ws.send(json.dumps({"type": "turnTimeout"}))
 
 
 async def run_bot_session(identity: dict,

@@ -182,9 +182,13 @@ def _path_is_clear(from_pos: int, steps: int, color: str,
 
 
 def _arrival_case(color: str, all_marbles: list[int],
-                  from_pos: int, steps: int) -> int | None:
+                  from_pos: int, steps: int,
+                  marbles_by_color: dict, invincible_by_color: dict) -> int | None:
     """Port de getArrivelCaseIfCanPromote().
     Retourne la case d'arrivée cible ou None si le nombre de pas ne correspond pas.
+    Un pion INVINCIBLE sur le trajet jusqu'à la case de départ bloque la promotion,
+    comme un déplacement normal (ce chemin de code contourne _path_is_clear). La case
+    de départ elle-même est exclue : le pion promu bifurque sans l'occuper.
     """
     available = [p for p in ARRIVAL_POSITIONS[color] if p not in all_marbles]
     if not available:
@@ -195,6 +199,12 @@ def _arrival_case(color: str, all_marbles: list[int],
     while MAIN_PATH[idx] != start:         # + pas jusqu'au start sur le chemin
         required += 1
         idx = (idx + 1) % _MAIN_PATH_LEN
+        pos = MAIN_PATH[idx]
+        if pos == start:
+            continue
+        owner = _color_at_position(pos, marbles_by_color)
+        if owner is not None and _is_invincible(pos, owner, invincible_by_color):
+            return None
     return available[-1] if required == steps else None
 
 
@@ -209,7 +219,8 @@ def _build_forward(card_value: str, from_pos: int, steps: int,
     if to is None:
         return None
     if _start_btw(from_pos, to, color):
-        arrival = _arrival_case(color, all_marbles, from_pos, steps)
+        arrival = _arrival_case(color, all_marbles, from_pos, steps,
+                                marbles_by_color, invincible_by_color)
         if arrival is not None:
             return {'type': 'promote', 'from': from_pos, 'to': arrival}
     if to in own_marbles:
@@ -366,11 +377,12 @@ ACTION_DIM  = DISCARD_IDX + 1      # 501
 # ── Layout 2v2 DÉDIÉ (option (a) retenue) ─────────────────────────────────────
 # Le 7 partagé (2e pion ∈ 8 pions de l'équipe) et le Valet libre (source ∈ 16 pions)
 # débordent du layout 1v3 → layout étendu, sélectionné par teammate_color is not None.
-# Le choix de la COMPLÉTUDE TOTALE (J : 16 sources, y compris ennemi↔ennemi) n'est pas
-# un luxe : le serveur compte ces swaps comme coups légaux (canDiscard=false). Si le
-# masque ne savait pas les exprimer alors qu'ils sont le SEUL coup légal, le fallback
-# défausse serait rejeté (actionRejected) → timeout à chaque tour. Même logique pour
-# l'entrée solidaire, qui a son propre index (seul coup légal quand elle s'applique).
+# Le choix de la COMPLÉTUDE (J : 16 sources, y compris un pion adverse échangé contre
+# un pion de l'équipe) n'est pas un luxe : le serveur compte ces swaps comme coups
+# légaux (canDiscard=false). Si le masque ne savait pas les exprimer alors qu'ils sont
+# le SEUL coup légal, le fallback défausse serait rejeté (actionRejected) → timeout à
+# chaque tour. Même logique pour l'entrée solidaire, qui a son propre index (seul coup
+# légal quand elle s'applique).
 # Le « switch » de fin de jeu, lui, est GRATUIT : les 4 slots pions deviennent ceux de
 # la couleur contrôlée (l'appelant passe color=controlled), aucun changement de layout.
 #
@@ -385,7 +397,8 @@ ACTION_DIM  = DISCARD_IDX + 1      # 501
 #   'J' :
 #     0..191  : (source ∈ 0..15 ordre d'équipe) × (cible ∈ 0..11)
 #               sub = src*12 + t ; les 12 cibles = pions des 3 couleurs ≠ couleur
-#               source, dans l'ordre d'équipe
+#               source, dans l'ordre d'équipe. Les paires adverse ↔ adverse gardent
+#               leur index mais ne sont jamais légales.
 #   autres :
 #     0..3    : marble_idx = sub (pion contrôlé)
 #
@@ -462,14 +475,18 @@ def _build_7_split(marble_a_pos: int, steps1: int, marble_b_pos: int,
                    invincible_by_color: dict,
                    teammate_color: str | None = None) -> dict | None:
     """Port de getLegalSplit7Action : pion A avance steps1, pion B avance 7-steps1.
-    Le contexte du second demi-coup tient compte du déplacement du premier pion
-    (et le premier pion n'est plus invincible après avoir bougé).
+    Les deux moitiés bougent dans le MÊME coup : le premier demi-coup est évalué
+    avec le second pion RETIRÉ du plateau (port de getSplitFirstAction) — passer sur
+    sa case actuelle, ou s'y arrêter, n'est ni un blocage ni une capture puisqu'il la
+    quitte dans ce même coup. Le contexte du second demi-coup tient compte du
+    déplacement du premier pion (qui n'est plus invincible après avoir bougé).
 
     2v2 (teammate_color fourni) : le PREMIER pion doit être un pion contrôlé
     (« own d'abord » — commencer par un pion du coéquipier est illégal), le SECOND
     peut être un pion contrôlé OU un pion du coéquipier, validé du point de vue de
     SON propriétaire (son start, ses arrivées). Pas d'immunité d'équipe : le second
-    pion PEUT capturer un pion de sa propre équipe.
+    pion PEUT capturer un pion de sa propre équipe — mais jamais atterrir sur la case
+    où le premier vient d'arriver.
     """
     if not (1 <= steps1 <= 6):
         return None
@@ -489,7 +506,12 @@ def _build_7_split(marble_a_pos: int, steps1: int, marble_b_pos: int,
         if marble_b_pos not in marbles_by_color.get(teammate_color, []):
             return None
 
-    action1 = _build_forward('7', marble_a_pos, steps1, own_marbles, all_marbles,
+    # Seul all_marbles perd le second pion (comme ctxWithoutFrom2 côté TS) :
+    # own_marbles le garde (un de MES pions reste un atterrissage interdit) et
+    # marbles_by_color/invincible aussi (un pieu sur le trajet d'une PROMOTION bloque
+    # toujours, même s'il est le second pion du split).
+    all_without_b = [p for p in all_marbles if p != marble_b_pos]
+    action1 = _build_forward('7', marble_a_pos, steps1, own_marbles, all_without_b,
                              color, marbles_by_color, invincible_by_color)
     if action1 is None:
         return None
@@ -503,10 +525,6 @@ def _build_7_split(marble_a_pos: int, steps1: int, marble_b_pos: int,
     # interne 'steps1', consommé par build_server_message.
 
     to1 = action1['to']
-    # Un pion capturé par le premier demi-coup est renvoyé en réserve : il ne peut
-    # pas être le second pion du split (garde `from2 === to1` du validateur TS).
-    if marble_b_pos == to1:
-        return None
     new_own = [to1 if p == marble_a_pos else p for p in own_marbles]
     new_all = [to1 if p == marble_a_pos else p for p in all_marbles]
     new_mbc = {
@@ -526,6 +544,9 @@ def _build_7_split(marble_a_pos: int, steps1: int, marble_b_pos: int,
     action2 = _build_forward_for_marble('7', marble_b_pos, 7 - steps1,
                                         new_all, new_mbc, new_inv)
     if action2 is None:
+        return None
+    # Les deux pions ne peuvent pas atterrir sur la même case.
+    if action2['to'] == to1:
         return None
 
     split = {
@@ -614,9 +635,10 @@ def _generate_moves(hand: list, marble_positions: list[int],
 
         elif card_value == 'J':
             if team_mode:
-                # 2v2 : échange N'IMPORTE QUELLE paire de pions de couleurs
-                # différentes — la source n'a plus besoin d'appartenir au joueur
-                # actif (port du cas J de getLegalAction avec teammateColor).
+                # 2v2 : échange deux pions de couleurs différentes dont AU MOINS UN
+                # appartient à l'équipe active — la source n'a pas besoin d'être un
+                # pion contrôlé (port du cas J de getLegalAction), mais un échange
+                # adverse ↔ adverse est interdit (le serveur le rejette).
                 # Source : sur le main path, pas invincible. Cible : swappable
                 # (main path, ni home ni arrivée, pas invincible) et couleur ≠
                 # couleur source (garantie par construction des slots).
@@ -625,7 +647,10 @@ def _generate_moves(hand: list, marble_positions: list[int],
                         continue
                     if _is_invincible(pos, src_color, invincible_by_color):
                         continue
-                    for t_idx, (_, target_pos) in enumerate(j_tgt_slots[src_color]):
+                    src_is_own_team = same_team(src_color, color)
+                    for t_idx, (tgt_color, target_pos) in enumerate(j_tgt_slots[src_color]):
+                        if not src_is_own_team and not same_team(tgt_color, color):
+                            continue
                         if not _is_swappable(target_pos, marbles_by_color,
                                              invincible_by_color):
                             continue
@@ -668,10 +693,9 @@ def _generate_moves(hand: list, marble_positions: list[int],
 
 
 # Priorité de la carte sacrifiée pour l'entrée solidaire (port de
-# SOLIDAIRE_CARD_PRIORITY) : le Roi d'abord, puis l'As, le Joker en dernier recours.
-# (Cette fonction ne se déclenche que main ENTIÈREMENT bloquée : l'option d'avance de
-# 13 du Roi est alors, elle aussi, nécessairement bloquée — l'ordre reste valable.)
-_SOLIDAIRE_CARD_PRIORITY = ('K', 'A', 'Joker')
+# SOLIDAIRE_CARD_PRIORITY) : l'As d'abord (+1, le déplacement le plus faible des
+# trois), puis le Roi (+13), le Joker en dernier recours (+18 et rejeu).
+_SOLIDAIRE_CARD_PRIORITY = ('A', 'K', 'Joker')
 
 
 def find_solidaire_entry(hand: list, color: str, marbles_by_color: dict,
@@ -785,8 +809,12 @@ def get_legal_mask(hand: list, marble_positions: list[int],
 def build_server_message(action_idx: int, hand: list, marble_positions: list[int],
                          color: str, marbles_by_color: dict,
                          invincible_by_color: dict | None = None,
-                         teammate_color: str | None = None) -> dict:
+                         teammate_color: str | None = None,
+                         legal: tuple | None = None) -> dict:
     """Convertit un index d'action en message WebSocket pour le serveur.
+
+    legal : (mask, actions) déjà calculés par get_legal_mask pour CETTE position,
+    pour ne pas les régénérer (None = recalcul ici).
 
     En 2v2 (teammate_color fourni), `color`/`marble_positions` = couleur CONTRÔLÉE
     et ses positions (comme pour get_legal_mask). Les champs internes marbleColor/
@@ -807,9 +835,9 @@ def build_server_message(action_idx: int, hand: list, marble_positions: list[int
             },
         }
 
-    mask, actions = get_legal_mask(hand, marble_positions, color, marbles_by_color,
-                                   invincible_by_color, False,
-                                   teammate_color=teammate_color)
+    mask, actions = legal or get_legal_mask(
+        hand, marble_positions, color, marbles_by_color, invincible_by_color, False,
+        teammate_color=teammate_color)
     entry = actions[action_idx] if 0 <= action_idx < dim else None
     if entry is None or entry == 'discard' or not mask[action_idx]:
         return build_server_message(discard_idx, hand, marble_positions, color,

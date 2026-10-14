@@ -103,18 +103,31 @@ class TestJackTeam(unittest.TestCase):
     def _swaps(self, mask, actions):
         return [a for _, _, a in legal_entries(mask, actions) if a['type'] == 'swap']
 
-    def test_2v2_swap_two_foreign_marbles(self):
-        # Rouge joue le Valet ; green en 10 et orange en 25, aucun pion rouge en jeu.
+    def test_2v2_swap_teammate_marble_with_enemy(self):
+        # Rouge joue le Valet ; blue (coéquipier) en 10, green (adverse) en 25,
+        # aucun pion rouge en jeu : la source n'a pas à être un pion contrôlé.
         marbles = {**empty_by_color(), 'red': list(HOME_POSITIONS['red']),
-                   'green': [10], 'orange': [25]}
+                   'blue': [10], 'green': [25]}
         mask, actions = team_mask([card('J')], 'red', marbles)
         swaps = self._swaps(mask, actions)
         self.assertEqual(sorted((s['from'], s['to']) for s in swaps),
                          [(10, 25), (25, 10)],
-                         "échange green↔orange sans pion du joueur actif")
+                         "échange blue↔green sans pion du joueur actif")
         by_from = {s['from']: s for s in swaps}
-        self.assertEqual(by_from[10]['marbleColor'], 'green',
+        self.assertEqual(by_from[10]['marbleColor'], 'blue',
                          "marbleColor = couleur du pion source")
+
+    def test_2v2_enemy_enemy_swap_rejected(self):
+        # green et orange sont tous deux adverses de l'équipe red+blue : le serveur
+        # REJETTE cet échange (actionRejected → tour perdu au timeout si on l'envoie).
+        marbles = {**empty_by_color(), 'red': [40],
+                   'green': [10], 'orange': [25]}
+        mask, actions = team_mask([card('J')], 'red', marbles)
+        pairs = {(s['from'], s['to']) for s in self._swaps(mask, actions)}
+        self.assertNotIn((10, 25), pairs)
+        self.assertNotIn((25, 10), pairs)
+        self.assertIn((40, 10), pairs, "un pion de l'équipe reste échangeable")
+        self.assertIn((10, 40), pairs, "source adverse ↔ cible de l'équipe : autorisé")
 
     def test_2v2_same_color_pair_rejected(self):
         marbles = {**empty_by_color(), 'red': list(HOME_POSITIONS['red']),
@@ -124,9 +137,10 @@ class TestJackTeam(unittest.TestCase):
                          "deux pions de MÊME couleur ne s'échangent pas")
 
     def test_2v2_invincible_protected_as_source_and_target(self):
-        # Orange fraîchement entré sur son start (91) = invincible.
+        # Paire autorisée par la règle d'équipe (blue = coéquipier, orange = adverse) :
+        # seule l'invincibilité bloque. Orange fraîchement entré sur son start (91).
         marbles = {**empty_by_color(), 'red': list(HOME_POSITIONS['red']),
-                   'green': [10], 'orange': [START_POSITIONS['orange']]}
+                   'blue': [10], 'orange': [START_POSITIONS['orange']]}
         invincible = {**empty_by_color(), 'orange': [START_POSITIONS['orange']]}
         mask, actions = team_mask([card('J')], 'red', marbles, invincible=invincible)
         self.assertEqual(self._swaps(mask, actions), [],
@@ -139,15 +153,22 @@ class TestJackTeam(unittest.TestCase):
         self.assertEqual([(s['from'], s['to']) for s in swaps], [(10, 25)],
                          "1v3 : source propre uniquement")
 
-    def test_2v2_enemy_swap_exists_without_own_source_but_not_in_1v3(self):
+    def test_2v2_swap_exists_without_own_source_but_not_in_1v3(self):
         # Tous les pions rouges en réserve : aucune source propre possible.
         # (le pendant Python de findLegalMoveForCard : la défausse ne doit pas
-        # être proposée en 2v2 alors qu'un swap ennemi↔ennemi est jouable)
+        # être proposée en 2v2 alors qu'un swap coéquipier↔adverse est jouable)
         marbles = {**empty_by_color(), 'red': list(HOME_POSITIONS['red']),
-                   'green': [10], 'orange': [25]}
+                   'blue': [10], 'green': [25]}
         mask, actions = team_mask([card('J')], 'red', marbles)
-        self.assertTrue(self._swaps(mask, actions), '2v2 : swap green↔orange trouvé')
+        self.assertTrue(self._swaps(mask, actions), '2v2 : swap blue↔green trouvé')
         self.assertFalse(mask[DISCARD_IDX_2V2], '2v2 : pas de défausse possible')
+
+        # Adverse ↔ adverse seul : aucun coup, la défausse redevient le seul choix.
+        enemies = {**empty_by_color(), 'red': list(HOME_POSITIONS['red']),
+                   'green': [10], 'orange': [25]}
+        mask_e, actions_e = team_mask([card('J')], 'red', enemies)
+        self.assertEqual(self._swaps(mask_e, actions_e), [])
+        self.assertTrue(mask_e[DISCARD_IDX_2V2], '2v2 : défausse forcée')
 
         mask13, actions13 = get_legal_mask([card('J')], marbles['red'], 'red', marbles)
         self.assertEqual(self._swaps(mask13, actions13), [],
@@ -205,12 +226,13 @@ class TestKingDualUse(unittest.TestCase):
 # et …220→219→218→217(start blue)→216… ; arrivées blue = [188,173,158,143].
 
 class TestSevenTeam(unittest.TestCase):
-    def _split(self, m_a, s1, m_b, own_color, marbles, teammate='auto'):
+    def _split(self, m_a, s1, m_b, own_color, marbles, teammate='auto',
+               invincible=None):
         if teammate == 'auto':
             teammate = get_teammate_color(own_color)
         all_marbles = [p for ps in marbles.values() for p in ps]
         return _build_7_split(m_a, s1, m_b, marbles[own_color], all_marbles,
-                              own_color, marbles, empty_by_color(),
+                              own_color, marbles, invincible or empty_by_color(),
                               teammate_color=teammate)
 
     def test_split_own_plus_teammate(self):
@@ -250,11 +272,34 @@ class TestSevenTeam(unittest.TestCase):
         self.assertEqual(action['splitType'], 'capture',
                          'atterrir sur un pion allié le capture (pas d\'immunité)')
 
-    def test_marble_captured_by_first_move_cannot_be_second(self):
-        # Red 10 → 25 capture le pion blue en 25 : renvoyé en réserve, il ne peut
-        # pas servir de second pion au split.
+    def test_first_marble_lands_on_current_square_of_second(self):
+        # Bug de prod côté serveur, corrigé depuis : red en 10, coéquipier blue une
+        # case devant (25). Les deux moitiés bougent dans le MÊME coup : red avance
+        # dans la case que blue quitte — ce n'est pas une capture.
         marbles = {**empty_by_color(), 'red': [10], 'blue': [25]}
-        self.assertIsNone(self._split(10, 1, 25, 'red', marbles))
+        action = self._split(10, 1, 25, 'red', marbles)
+        self.assertIsNotNone(action, 'le split reste légal même si to1 == from2')
+        self.assertEqual((action['to'], action['type']), (25, 'move'))
+        self.assertEqual((action['splitFrom'], action['splitTo'], action['splitType']),
+                         (25, 87, 'move'))
+        self.assertEqual(action['splitMarbleColor'], 'blue')
+
+    def test_both_halves_cannot_land_on_same_square(self):
+        # Red en 10 et blue en 7 : avec 2+5, les deux pions convergent sur 40.
+        marbles = {**empty_by_color(), 'red': [10], 'blue': [7]}
+        self.assertIsNone(self._split(10, 2, 7, 'red', marbles),
+                          'to1 == to2 est illégal')
+
+    def test_teammate_invincible_marble_ahead_does_not_block_split(self):
+        # Red 218 est bloqué seul par blue 217 (invincible, start blue) ; mais blue
+        # quitte 217 dans le même coup → le split est légal, donc pas de défausse.
+        marbles = {**empty_by_color(), 'red': [218], 'blue': [217, 205]}
+        invincible = {**empty_by_color(), 'blue': [217]}
+        self.assertIsNotNone(self._split(218, 1, 217, 'red', marbles,
+                                         invincible=invincible))
+        mask, _ = team_mask([card('7')], 'red', marbles, invincible=invincible)
+        self.assertFalse(mask[DISCARD_IDX_2V2])
+        self.assertFalse(any(mask[:4]), 'le 7 entier, lui, reste bloqué')
 
     def test_1v3_split_limited_to_own_marbles(self):
         marbles = {**empty_by_color(), 'red': [10], 'blue': [86]}
@@ -300,6 +345,30 @@ class TestSevenTeam(unittest.TestCase):
         self.assertEqual((action['from'], action['to'],
                           action['splitFrom'], action['splitTo']),
                          (10, 25, 86, 120))
+
+
+# ── promote-invincible-block.test.ts ──────────────────────────────────────────
+
+class TestPromoteInvincibleBlock(unittest.TestCase):
+    # Green start = 135. Pion green en 8 : 15 pas jusqu'à 135 + 3 cases d'arrivée
+    # = 18 pas, exactement la distance du Joker. Le trajet passe par 9 (start red).
+
+    def test_invincible_marble_on_the_way_blocks_promotion(self):
+        marbles = {**empty_by_color(), 'green': [8], 'red': [9]}
+        invincible = {**empty_by_color(), 'red': [9]}
+        self.assertIsNone(get_legal_action('Joker', 8, [8], [8, 9], 'green', marbles,
+                                           invincible))
+        self.assertIsNotNone(get_legal_action('Joker', 8, [8], [8, 9], 'green',
+                                              marbles),
+                             'sans invincibilité, la promotion reste légale')
+
+    def test_own_invincible_marble_on_own_start_does_not_block(self):
+        marbles = {**empty_by_color(), 'green': [8, 135]}
+        invincible = {**empty_by_color(), 'green': [135]}
+        action = get_legal_action('Joker', 8, [8, 135], [8, 135], 'green', marbles,
+                                  invincible)
+        self.assertIsNotNone(action)
+        self.assertEqual((action['type'], action['to']), ('promote', 115))
 
 
 # ── solidaire.test.ts ─────────────────────────────────────────────────────────
@@ -368,14 +437,14 @@ class TestSolidaire(unittest.TestCase):
                    'blue': [HOME_POSITIONS['blue'][0]]}
         self.assertIsNone(self._solidaire([card('K')], 'red', marbles, teammate=None))
 
-    def test_card_priority_K_A_Joker(self):
+    def test_card_priority_A_K_Joker(self):
         # Pions red tous à l'abri (aucun coup possible avec aucune carte).
         marbles = {**empty_by_color(),
                    'red':  list(ARRIVAL_POSITIONS['red']),
                    'blue': [HOME_POSITIONS['blue'][0], 86]}
         pick = lambda hand: self._solidaire(hand, 'red', marbles)[0]['value']
-        self.assertEqual(pick([card('Joker'), card('A'), card('K')]), 'K')
-        self.assertEqual(pick([card('Joker'), card('A')]), 'A')
+        self.assertEqual(pick([card('Joker'), card('K'), card('A')]), 'A')
+        self.assertEqual(pick([card('Joker'), card('K')]), 'K')
         self.assertEqual(pick([card('Joker')]), 'Joker')
 
     def test_no_double_trigger_after_switch(self):
