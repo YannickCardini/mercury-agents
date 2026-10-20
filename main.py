@@ -3,9 +3,12 @@ Service d'agents Mercury — piloté par webhook depuis le backend.
 
 Architecture :
   Backend matchmaking ──POST /dispatch──> ce service
-  Le service choisit une identité libre, spawne un bot qui rejoint la
-  matchmaking et joue une partie. Le timing (10 s, +15 s, etc.) est géré
-  côté backend : il sait quand il a besoin d'un joueur.
+  Le service choisit une identité libre (de préférence hors `avoidUserIds`,
+  les bots déjà croisés récemment par les humains de la file), spawne un bot
+  qui rejoint la matchmaking et joue une partie. Le timing d'arrivée est
+  scripté côté backend (matchmaking-script.ts) : il sait quand il a besoin
+  d'un joueur. Un bot renvoyé de la file (socket fermée avant `welcome`)
+  libère simplement son identité.
 
 Endpoints :
   POST /dispatch   header X-Bot-Secret      → 200 dispatché / 503 occupé
@@ -18,6 +21,7 @@ persistant local, healthcheck inclus.
 
 import asyncio
 import json
+import math
 import os
 import random
 import time
@@ -31,6 +35,7 @@ from mercury_legal_moves import (
     get_controlled_color, get_teammate_color, same_team,
 )
 from plan_hand import plan_hand_pick
+from persona import FAVORITE_WEIGHT, persona_for
 from game_state_utils import (
     detect_winners as _detect_winners,
     marbles_by_color as _marbles_by_color,
@@ -52,9 +57,36 @@ DEFAULT_GAME_MODE = "2v2"   # défaut serveur
 LISTEN_HOST = os.environ.get("MERCURY_AGENT_HOST", "0.0.0.0")
 LISTEN_PORT = int(os.environ.get("MERCURY_AGENT_PORT", os.environ.get("PORT", "8000")))
 
-# Délais simulés pour imiter un joueur humain (secondes)
+# Temps de réflexion simulé (secondes), bornes surchargeables par l'environnement.
+# Le serveur impose un coup au bout d'environ 60 s : rester très en dessous.
 THINK_MIN = float(os.environ.get("MERCURY_THINK_MIN", "0.5"))
-THINK_MAX = float(os.environ.get("MERCURY_THINK_MAX", "8.5"))
+THINK_MAX = float(os.environ.get("MERCURY_THINK_MAX", "14"))
+# Coup unique ou forcé : le temps de voir la carte et de la poser.
+THINK_FORCED = (0.6, 1.5)
+# Rare hésitation (distraction, relecture du plateau) : chance, délai ajouté.
+THINK_HESITATION = (0.04, (3.0, 6.0))
+
+
+def think_delay(n_legal: int, first_turn: bool, pace: float,
+                rng: random.Random | None = None) -> float:
+    """Temps de réflexion d'un humain pour un coup parmi `n_legal` possibles.
+
+    Un coup forcé part vite ; sinon la médiane croît avec le logarithme du nombre
+    de coups (2 coups ≈ 1,9 s, 64 coups ≈ 5,4 s), avec une dispersion log-normale
+    et le rythme propre au bot (persona). Le premier tour de la partie est un peu
+    plus long (on découvre sa main et le plateau)."""
+    rng = rng or random
+    if n_legal <= 1:
+        delay = rng.uniform(*THINK_FORCED)
+    else:
+        median = 1.2 + 0.7 * math.log2(n_legal)
+        delay = median * math.exp(0.45 * rng.gauss(0.0, 1.0)) * pace
+    if first_turn:
+        delay += rng.uniform(1.0, 3.0)
+    chance, extra = THINK_HESITATION
+    if rng.random() < chance:
+        delay += rng.uniform(*extra)
+    return max(THINK_MIN, min(THINK_MAX, delay))
 
 # Identités des bots. Les comptes correspondants existent déjà en base ;
 # le nom est récupéré depuis la réponse de /api/auth/bot.
@@ -89,7 +121,8 @@ def _ts() -> str:
 #   'ally'  → mon coéquipier (2v2 uniquement : red+blue vs green+orange)
 #   'enemy' → tout le reste (= tous les autres en 1v3, comportement historique)
 # Les tables historiques (own/enemy) sont INCHANGÉES ; les tables _ALLY ne sont
-# consultées qu'en 2v2. Palette = REACTION_EMOJIS du serveur (12 emojis).
+# consultées qu'en 2v2. Palette = REACTION_EMOJIS du serveur (15 emojis, dont
+# 9 de boutique) ; chaque bot ne pioche que dans les emojis de sa persona.
 
 def _reaction_relation(my_color: str, other_color: str | None, game_mode: str) -> str:
     """Relation emoji à l'auteur d'une action ou d'une réaction (cf. bloc ci-dessus)."""
@@ -103,17 +136,17 @@ def _reaction_relation(my_color: str, other_color: str | None, game_mode: str) -
 # (action_type, is_own_action) → (base_probability, [(emoji, weight)])
 # True = 'own', False = 'enemy' (l'allié 2v2 a sa table dédiée ci-dessous).
 REACTION_ACTION_TABLE: dict[tuple[str, bool], tuple[float, list[tuple[str, int]]]] = {
-    ("enter",   True):  (1/30, [("👏", 60), ("🔥", 25), ("😎", 10), ("😂",  5)]),
+    ("enter",   True):  (1/30, [("👏", 60), ("🔥", 25), ("😎", 10), ("😊",  8), ("😂",  5)]),
     ("enter",   False): (1/50, [("😮", 50), ("🤔", 30), ("😥", 15), ("😡",  5)]),
     ("move",    True):  (1/90, [("🤔", 50), ("🔥", 25), ("😎", 15), ("👏", 10)]),
     ("move",    False): (1/100, [("😴", 40), ("🥱", 35), ("🤔", 20), ("😮",  5)]),
     ("capture", True):  (1/10, [("🔥", 50), ("😎", 25), ("👏", 15), ("😂", 10)]),
     ("capture", False): (1/8,  [("😡", 55), ("😥", 25), ("😮", 15), ("😂",  5)]),
-    ("promote", True):  (1/12, [("😎", 50), ("👏", 25), ("🔥", 20), ("😂",  5)]),
+    ("promote", True):  (1/12, [("😎", 50), ("👏", 25), ("🔥", 20), ("😊",  8), ("😂",  5)]),
     ("promote", False): (1/25, [("😥", 40), ("😡", 25), ("😮", 25), ("🤔", 10)]),
     ("discard", True):  (1/25, [("😥", 40), ("🤔", 35), ("🥱", 15), ("😴", 10)]),
     ("discard", False): (1/50, [("😴", 40), ("🥱", 35), ("🤔", 15), ("😮", 10)]),
-    ("swap",    True):  (1/12, [("😎", 40), ("🔥", 30), ("😂", 20), ("👏", 10)]),
+    ("swap",    True):  (1/12, [("😎", 40), ("🔥", 30), ("😂", 20), ("😉", 12), ("👏", 10)]),
     ("swap",    False): (1/10, [("🦧", 45), ("😮", 30), ("😥", 20), ("😂",  5)]),
 }
 
@@ -123,12 +156,12 @@ REACTION_ACTION_TABLE: dict[tuple[str, bool], tuple[float, list[tuple[str, int]]
 # NB : une capture alliée peut, rarement, être du friendly-fire (7 partagé) — l'action
 # diffusée ne porte pas la victime, on assume le cas courant (capture d'un ennemi).
 REACTION_ACTION_TABLE_ALLY: dict[str, tuple[float, list[tuple[str, int]]]] = {
-    "enter":   (1/35, [("👏", 55), ("🔥", 25), ("😎", 15), ("😂",  5)]),
+    "enter":   (1/35, [("👏", 55), ("🔥", 25), ("😎", 15), ("😊", 10), ("😂",  5)]),
     "move":    (1/110, [("🤔", 40), ("👏", 25), ("😎", 20), ("🥱", 15)]),
     "capture": (1/12, [("🔥", 50), ("👏", 25), ("😂", 15), ("😎", 10)]),
-    "promote": (1/12, [("👏", 50), ("🔥", 25), ("😎", 20), ("😂",  5)]),
+    "promote": (1/12, [("👏", 50), ("🔥", 25), ("😎", 20), ("😘",  8), ("😂",  5)]),
     "discard": (1/40, [("😥", 45), ("🤔", 30), ("😮", 15), ("🥱", 10)]),
-    "swap":    (1/12, [("😎", 40), ("🔥", 30), ("👏", 20), ("😂", 10)]),
+    "swap":    (1/12, [("😎", 40), ("🔥", 30), ("👏", 20), ("😉", 12), ("😂", 10)]),
 }
 
 # emoji reçu → (base_probability, [(emoji_réponse, weight)])
@@ -146,6 +179,9 @@ REACTION_BROADCAST_TABLE: dict[str, tuple[float, list[tuple[str, int]]]] = {
     "⏰": (1/25, [("⏰", 45), ("😴", 30), ("🥱", 25)]),
     "🥱": (1/30, [("🥱", 50), ("😴", 30), ("😂", 20)]),
     "🦧": (1/20, [("🦧", 100)]),
+    "😉": (1/25, [("😉", 40), ("😂", 35), ("🤔", 25)]),
+    "😘": (1/30, [("😮", 40), ("😂", 35), ("😉", 25)]),
+    "😊": (1/30, [("😊", 50), ("👏", 30), ("😂", 20)]),
 }
 
 # Réponses à l'emoji de mon COÉQUIPIER (2v2) : on fait équipe — on amplifie ses
@@ -153,7 +189,7 @@ REACTION_BROADCAST_TABLE: dict[str, tuple[float, list[tuple[str, int]]]] = {
 # et on rejoint ses pitreries. Probabilités un peu plus hautes : on se répond
 # davantage entre coéquipiers qu'à des adversaires.
 REACTION_BROADCAST_TABLE_ALLY: dict[str, tuple[float, list[tuple[str, int]]]] = {
-    "👏": (1/18, [("👏", 60), ("😂", 25), ("🔥", 15)]),
+    "👏": (1/18, [("👏", 60), ("😂", 25), ("🔥", 15), ("😊", 10)]),
     "😂": (1/16, [("😂", 60), ("👏", 25), ("😎", 15)]),
     "😮": (1/25, [("😮", 50), ("😂", 30), ("🤔", 20)]),
     "😥": (1/30, [("😥", 40), ("👏", 30), ("🤔", 30)]),
@@ -165,6 +201,9 @@ REACTION_BROADCAST_TABLE_ALLY: dict[str, tuple[float, list[tuple[str, int]]]] = 
     "⏰": (1/30, [("⏰", 45), ("😂", 30), ("😴", 25)]),
     "🥱": (1/30, [("🥱", 40), ("😂", 35), ("😴", 25)]),
     "🦧": (1/20, [("🦧", 60), ("😂", 40)]),
+    "😉": (1/20, [("😉", 45), ("😂", 35), ("😎", 20)]),
+    "😘": (1/18, [("😘", 45), ("😊", 30), ("😂", 25)]),
+    "😊": (1/20, [("😊", 50), ("👏", 30), ("😘", 20)]),
 }
 
 
@@ -178,6 +217,12 @@ class InferenceBot:
         # Hint du dispatch — écrasé par gameState.gameMode (source de vérité) en partie.
         self.game_mode = game_mode
         self.bot_id = identity["botId"]
+        # Habitudes du bot (emojis, bavardage, rythme), les mêmes à chaque partie.
+        self.persona = persona_for(self.bot_id)
+        self._turns_played = 0
+        # Vrai dès que le serveur a confirmé le siège (`welcome`) : sinon une
+        # fermeture de socket est un renvoi de la file, pas une fin de partie.
+        self.welcomed = False
         self.name: str          = self.bot_id  # remplacé après authenticate()
         self.picture: str       = ""            # remplacé après authenticate()
         self.session_token: str = ""            # remplacé après authenticate()
@@ -247,16 +292,24 @@ class InferenceBot:
         candidates: list[tuple[str, int]],
         base_prob: float,
     ) -> str | None:
-        if random.random() >= base_prob:
+        """Tirage d'une réaction selon la persona : probabilité modulée par son
+        bavardage, réponses limitées aux emojis gratuits et à ceux qu'elle
+        possède, emoji fétiche favorisé."""
+        persona = self.persona
+        if random.random() >= min(1.0, base_prob * persona.chattiness):
             return None
-        total = sum(w for _, w in candidates)
+        usable = [(emoji, w * (FAVORITE_WEIGHT if emoji == persona.favorite else 1))
+                  for emoji, w in candidates if persona.can_use(emoji)]
+        if not usable:
+            return None
+        total = sum(w for _, w in usable)
         r = random.uniform(0, total)
         acc = 0
-        for emoji, w in candidates:
+        for emoji, w in usable:
             acc += w
             if acc > r:
                 return emoji
-        return candidates[-1][0]
+        return usable[-1][0]
 
     async def _schedule_reaction(self, ws, emoji: str, delay: float) -> None:
         try:
@@ -341,6 +394,7 @@ class InferenceBot:
 
             if mtype == "welcome":
                 # Confirme le seat (lancement normal ou re-seat après restart serveur).
+                self.welcomed = True
                 print(f"[{_ts()}][{self.name}] welcome — gameId={msg.get('gameId')} "
                       f"couleur={msg.get('myColor')}", flush=True)
                 continue
@@ -443,9 +497,12 @@ class InferenceBot:
             print(f"[{_ts()}][{self.name}] ⚠️ sélection lente : {compute_s:.1f}s "
                   f"(risque de timeout serveur à ~65s)", flush=True)
         if think:
-            # Exponential distribution clipped to [THINK_MIN, THINK_MAX]: small delays are common, large ones rare
-            lam = 3.0 / (THINK_MAX - THINK_MIN)
-            target = THINK_MIN + min(random.expovariate(lam), THINK_MAX - THINK_MIN)
+            # Réflexion « humaine » : rapide sur un coup forcé, plus longue quand
+            # le choix est vaste (cf. think_delay), au rythme propre du bot.
+            target = think_delay(sum(1 for ok in mask if ok),
+                                 first_turn=self._turns_played == 0,
+                                 pace=self.persona.pace)
+            self._turns_played += 1
             # Le temps de CALCUL fait partie du "temps de réflexion" : on l'absorbe dans le
             # délai (avant, calcul + delay s'additionnaient → risque de dépasser le timeout
             # serveur). On dort le reste seulement.
@@ -501,7 +558,12 @@ async def run_bot_session(identity: dict,
             await bot.authenticate(client)
         async with websockets.connect(WS_URL) as ws:
             await bot.play_one_game(ws)
-        print(f"[{bot.name}] partie terminée")
+        if bot.welcomed:
+            print(f"[{bot.name}] partie terminée")
+        else:
+            # Arrivé après le lancement ou l'annulation de la file : le serveur
+            # ferme la socket (close 1000) et l'identité redevient libre.
+            print(f"[{bot.name}] renvoyé de la file avant le lancement", flush=True)
     except Exception as e:
         print(f"[bot {identity['botId']}] erreur de session : {e}")
 
@@ -514,11 +576,14 @@ def _cleanup_active(active: dict) -> None:
             del active[bid]
 
 
-def _next_free_identity(active: dict) -> dict | None:
+def _next_free_identity(active: dict, avoid: frozenset[str] = frozenset()) -> dict | None:
+    """Identité libre au hasard, de préférence hors `avoid` (bots croisés
+    récemment par les humains de la file) ; à défaut, n'importe laquelle."""
     free = [ident for ident in BOT_IDENTITIES if ident["botId"] not in active]
     if not free:
         return None
-    return random.choice(free)
+    fresh = [ident for ident in free if ident["botId"] not in avoid]
+    return random.choice(fresh or free)
 
 
 async def dispatch_handler(request: web.Request) -> web.Response:
@@ -529,17 +594,21 @@ async def dispatch_handler(request: web.Request) -> web.Response:
     # indiquer le mode de la partie. Body absent/invalide → défaut serveur (2v2).
     # Ce hint est ensuite écrasé par gameState.gameMode, la source de vérité en partie.
     game_mode = DEFAULT_GAME_MODE
+    # userId d'un bot = son botId (document Users) : liste directement comparable.
+    avoid: frozenset[str] = frozenset()
     try:
         body = await request.json()
         if isinstance(body, dict) and body.get("gameMode") in GAME_MODES:
             game_mode = body["gameMode"]
+        if isinstance(body, dict) and isinstance(body.get("avoidUserIds"), list):
+            avoid = frozenset(str(x) for x in body["avoidUserIds"])
     except Exception:
         pass
 
     active: dict = request.app["active"]
     _cleanup_active(active)
 
-    ident = _next_free_identity(active)
+    ident = _next_free_identity(active, avoid)
     if ident is None:
         return web.json_response({"status": "busy", "active": list(active)},
                                  status=503)

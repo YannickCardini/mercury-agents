@@ -1,0 +1,245 @@
+{
+  "1": {
+    "style": "chatty",
+    "chattiness": 2.0,
+    "owned": [],
+    "favorite": "😂",
+    "pace": 1.14
+  },
+  "2": {
+    "style": "silent",
+    "chattiness": 0.15,
+    "owned": [
+      "⏰"
+    ],
+    "favorite": "😂",
+    "pace": 0.77
+  },
+  "3": {
+    "style": "normal",
+    "chattiness": 1.0,
+    "owned": [],
+    "favorite": "😥",
+    "pace": 1.13
+  },
+  "4": {
+    "style": "normal",
+    "chattiness": 1.0,
+    "owned": [],
+    "favorite": null,
+    "pace": 1.23
+  },
+  "5": {
+    "style": "quiet",
+    "chattiness": 0.5,
+    "owned": [
+      "⏰",
+      "😊"
+    ],
+    "favorite": "😮",
+    "pace": 0.96
+  },
+  "6": {
+    "style": "quiet",
+    "chattiness": 0.5,
+    "owned": [],
+    "favorite": null,
+    "pace": 1.1
+  },
+  "7": {
+    "style": "normal",
+    "chattiness": 1.0,
+    "owned": [],
+    "favorite": null,
+    "pace": 0.77
+  },
+  "8": {
+    "style": "silent",
+    "chattiness": 0.15,
+    "owned": [
+      "⏰",
+      "😉",
+      "😘",
+      "😡"
+    ],
+    "favorite": null,
+    "pace": 1.29
+  },
+  "9": {
+    "style": "silent",
+    "chattiness": 0.15,
+    "owned": [],
+    "favorite": "👏",
+    "pace": 1.2
+  },
+  "10": {
+    "style": "normal",
+    "chattiness": 1.0,
+    "owned": [
+      "😘"
+    ],
+    "favorite": "😮",
+    "pace": 0.99
+  },
+  "11": {
+    "style": "quiet",
+    "chattiness": 0.5,
+    "owned": [],
+    "favorite": "😂",
+    "pace": 1.2
+  },
+  "12": {
+    "style": "chatty",
+    "chattiness": 2.0,
+    "owned": [],
+    "favorite": null,
+    "pace": 0.82
+  },
+  "13": {
+    "style": "quiet",
+    "chattiness": 0.5,
+    "owned": [],
+    "favorite": "😥",
+    "pace": 0.86
+  },
+  "14": {
+    "style": "silent",
+    "chattiness": 0.15,
+    "owned": [
+      "⏰",
+      "😴"
+    ],
+    "favorite": "👏",
+    "pace": 0.86
+  },
+  "15": {
+    "style": "chatty",
+    "chattiness": 2.0,
+    "owned": [],
+    "favorite": "🤔",
+    "pace": 1.16
+  },
+  "16": {
+    "style": "silent",
+    "chattiness": 0.15,
+    "owned": [
+      "😉",
+      "🥱"
+    ],
+    "favorite": null,
+    "pace": 0.87
+  },
+  "17": {
+    "style": "chatty",
+    "chattiness": 2.0,
+    "owned": [],
+    "favorite": "😮",
+    "pace": 1.1
+  },
+  "18": {
+    "style": "silent",
+    "chattiness": 0.15,
+    "owned": [
+      "😎",
+      "😡"
+    ],
+    "favorite": null,
+    "pace": 0.98
+  },
+  "19": {
+    "style": "quiet",
+    "chattiness": 0.5,
+    "owned": [
+      "⏰",
+      "😉",
+      "🦧"
+    ],
+    "favorite": "😉",
+    "pace": 1.04
+  },
+  "20": {
+    "style": "normal",
+    "chattiness": 1.0,
+    "owned": [
+      "😡"
+    ],
+    "favorite": "😥",
+    "pace": 1.01
+  },
+  "21": {
+    "style": "normal",
+    "chattiness": 1.0,
+    "owned": [
+      "😉",
+      "😎"
+    ],
+    "favorite": "👏",
+    "pace": 0.87
+  },
+  "22": {
+    "style": "normal",
+    "chattiness": 1.0,
+    "owned": [
+      "😉"
+    ],
+    "favorite": "🤔",
+    "pace": 1.35
+  },
+  "23": {
+    "style": "normal",
+    "chattiness": 1.0,
+    "owned": [],
+    "favorite": "😮",
+    "pace": 0.87
+  },
+  "24": {
+    "style": "quiet",
+    "chattiness": 0.5,
+    "owned": [
+      "😘",
+      "😡"
+    ],
+    "favorite": "😡",
+    "pace": 0.93
+  },
+  "25": {
+    "style": "quiet",
+    "chattiness": 0.5,
+    "owned": [
+      "⏰",
+      "😉",
+      "😎",
+      "😘",
+      "🥱",
+      "🦧"
+    ],
+    "favorite": "😎",
+    "pace": 0.95
+  },
+  "26": {
+    "style": "chatty",
+    "chattiness": 2.0,
+    "owned": [
+      "😊",
+      "😎",
+      "😘",
+      "😡",
+      "🦧"
+    ],
+    "favorite": null,
+    "pace": 1.23
+  },
+  "27": {
+    "style": "quiet",
+    "chattiness": 0.5,
+    "owned": [
+      "😎",
+      "😘",
+      "😡",
+      "🥱",
+      "🦧"
+    ],
+    "favorite": null,
+    "pace": 1.08
+  }
+}

@@ -18,8 +18,9 @@ from main import (  # noqa: E402
 )
 
 # Palette autorisée par le serveur (REACTION_EMOJIS, packages/shared/src/types.ts) :
-# tout emoji hors liste est silencieusement ignoré par handleReaction.
-SERVER_PALETTE = {'👏', '😂', '😮', '😥', '🔥', '🤔', '😡', '😎', '😴', '⏰', '🥱', '🦧'}
+# tout emoji hors liste est silencieusement ignoré par handleReaction. Les 6
+# premiers sont gratuits, les 9 autres viennent de la boutique (SHOP_CATALOG).
+SERVER_PALETTE = {'👏', '😂', '😮', '😥', '🔥', '🤔', '😡', '😎', '😴', '⏰', '🥱', '🦧', '😉', '😘', '😊'}
 
 SAD_OR_ANGRY = {'😥', '😡'}
 HAPPY = {'👏', '🔥', '😎', '😂'}
