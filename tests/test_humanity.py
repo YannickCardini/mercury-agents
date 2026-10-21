@@ -1,15 +1,16 @@
 """
 Comportements « humains » des bots : persona figée par identité (emojis
-possédés, bavardage, rythme), temps de réflexion selon le coup, et choix
-d'identité qui évite les bots déjà croisés par les humains de la file.
+possédés, bavardage, rythme), temps de réflexion selon le coup, choix
+d'identité qui évite les bots déjà croisés par les humains de la file, et pool
+relu en base (ajout d'un bot sans redéploiement).
 """
 
+import asyncio
 import json
 import pathlib
 import random
 import statistics
 import sys
-import tempfile
 import unittest
 from unittest import mock
 
@@ -18,9 +19,9 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import main  # noqa: E402
 from persona import (  # noqa: E402
     CHATTINESS_TIERS, FREE_EMOJIS, OWNERSHIP_TIERS, PAID_EMOJIS, PERSONAS_PATH,
-    Persona, load_personas, persona_for,
+    Persona, load_personas, parse_persona, persona_for,
 )
-from tools.generate_personas import generate  # noqa: E402
+from pool import BotPool  # noqa: E402
 
 from tests.test_reactions import SERVER_PALETTE  # noqa: E402
 
@@ -53,20 +54,75 @@ class TestFrozenPersonas(unittest.TestCase):
             count = sum(1 for n in owned if low <= n <= high)
             self.assertLessEqual(abs(count - share * len(owned)), 1, name)
 
-    def test_generator_never_rewrites_existing_personas(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = pathlib.Path(tmp) / "personas.json"
-            path.write_text(PERSONAS_PATH.read_text(encoding="utf-8"), encoding="utf-8")
-            added = generate(30, path)
-            self.assertEqual(added, ["28", "29", "30"])
-            after = json.loads(path.read_text(encoding="utf-8"))
-            for bot_id, data in self.raw.items():
-                self.assertEqual(after[bot_id], data, f"persona {bot_id} modifiée")
-            self.assertEqual(generate(30, path), [])
-
     def test_unknown_bot_gets_a_stable_fallback(self):
         self.assertEqual(persona_for("unknown-bot"), persona_for("unknown-bot"))
         self.assertEqual(load_personas(pathlib.Path("/nonexistent/personas.json")), {})
+
+
+class TestPersonaFromDatabase(unittest.TestCase):
+    DB = {"style": "quiet", "chattiness": 0.5, "owned": ["😎", "⏰"], "favorite": "😎", "pace": 0.8}
+
+    def test_database_persona_wins_over_local_file(self):
+        persona = persona_for("1", self.DB)
+        self.assertEqual(persona.owned, frozenset({"😎", "⏰"}))
+        self.assertEqual(persona.pace, 0.8)
+        self.assertNotEqual(persona, persona_for("1"), "personas.json diffère pour le bot 1")
+
+    def test_new_bot_from_database(self):
+        self.assertEqual(persona_for("104729384756102938475", self.DB).style, "quiet")
+
+    def test_invalid_database_persona_falls_back(self):
+        for bad in ({**self.DB, "owned": ["👏"]}, {**self.DB, "style": "loud"},
+                    {**self.DB, "favorite": "🦧"}, {"style": "quiet"}, "nope"):
+            self.assertIsNone(parse_persona(bad), bad)
+        self.assertEqual(persona_for("1", {"style": "loud"}), persona_for("1"))
+
+
+class TestBotPool(unittest.TestCase):
+    def _pool(self, responses, ttl=60.0):
+        calls = []
+
+        async def fetch():
+            calls.append(1)
+            result = responses.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
+        return BotPool("http://api", "secret", ["1", "2"], ttl=ttl, fetch=fetch), calls
+
+    def test_static_until_backend_answers(self):
+        pool, _ = self._pool([RuntimeError("404")])
+        self.assertEqual(pool.ids(), ["1", "2"])
+        asyncio.run(pool.refresh())
+        self.assertEqual(pool.ids(), ["1", "2"])
+        self.assertEqual(pool.source, "static")
+
+    def test_backend_pool_with_new_bot_and_persona(self):
+        persona = TestPersonaFromDatabase.DB
+        pool, _ = self._pool([[{"id": "1"}, {"id": "104729384756102938475", "persona": persona}]])
+        asyncio.run(pool.refresh())
+        self.assertEqual(pool.ids(), ["1", "104729384756102938475"])
+        self.assertEqual(pool.persona_data("104729384756102938475"), persona)
+        self.assertIsNone(pool.persona_data("1"))
+        self.assertEqual(pool.source, "backend")
+
+    def test_refreshes_at_most_once_per_ttl(self):
+        pool, calls = self._pool([[{"id": "1"}], [{"id": "1"}, {"id": "9"}]], ttl=60.0)
+        asyncio.run(pool.refresh())
+        asyncio.run(pool.refresh())
+        self.assertEqual(len(calls), 1)
+
+    def test_failure_keeps_last_known_pool(self):
+        pool, _ = self._pool([[{"id": "7"}, {"id": "8"}], RuntimeError("down"), []], ttl=0.0)
+        asyncio.run(pool.refresh())
+        asyncio.run(pool.refresh())
+        self.assertEqual(pool.ids(), ["7", "8"])
+        asyncio.run(pool.refresh())
+        self.assertEqual(pool.ids(), ["7", "8"], "une liste vide ne vide pas le pool")
+
+    def test_dispatch_picks_from_pool(self):
+        ident = main._next_free_identity({"7": {}}, frozenset(), ["7", "104729384756102938475"])
+        self.assertEqual(ident, {"botId": "104729384756102938475"})
 
 
 class TestPersonaReactions(unittest.TestCase):

@@ -5,9 +5,11 @@ Un humain a ses habitudes : certains n'envoient presque jamais d'emoji, d'autres
 réagissent à tout ; certains ont acheté des emojis en boutique, d'autres se
 contentent des gratuits ; certains jouent vite, d'autres prennent leur temps.
 Pour qu'un même bot se comporte pareil d'une partie à l'autre, sa persona est
-tirée UNE seule fois (tools/generate_personas.py) puis figée dans
-personas.json, versionné : un changement ultérieur des règles de tirage ne
-change jamais le caractère d'un bot existant.
+tirée une seule fois puis figée sur son compte en base (`botPersona`, posée par
+backend/scripts/add-bot.ts de Mercury), et transmise ici par le pool
+(GET /api/auth/bots). personas.json garde les personas des 27 premiers bots :
+c'est la source de leur import en base, et le repli tant que le backend ne
+fournit pas de persona.
 """
 
 from __future__ import annotations
@@ -107,12 +109,36 @@ def load_personas(path: pathlib.Path = PERSONAS_PATH) -> dict[str, Persona]:
 _PERSONAS = load_personas()
 
 
-def persona_for(bot_id: str) -> Persona:
+def parse_persona(data) -> Persona | None:
+    """Persona lue en base (via le pool), ou None si absente ou invalide."""
+    if not isinstance(data, dict):
+        return None
+    try:
+        persona = Persona.from_dict(data)
+    except (KeyError, TypeError, ValueError):
+        return None
+    styles = {name: mult for name, mult, _ in CHATTINESS_TIERS}
+    if styles.get(persona.style) != persona.chattiness:
+        return None
+    if not persona.owned <= set(PAID_EMOJIS):
+        return None
+    if persona.favorite is not None and not persona.can_use(persona.favorite):
+        return None
+    return persona
+
+
+def persona_for(bot_id: str, data: dict | None = None) -> Persona:
+    """Persona du compte en base si fournie, sinon personas.json, sinon repli déterministe."""
+    if data is not None:
+        persona = parse_persona(data)
+        if persona is not None:
+            return persona
+        print(f"⚠️ bot {bot_id} : persona en base invalide, repli local", flush=True)
     persona = _PERSONAS.get(bot_id)
     if persona is None:
-        # Bot ajouté sans relancer le générateur : persona déterministe (la même
-        # que le générateur lui donnerait), à figer avec tools/generate_personas.py.
-        print(f"⚠️ bot {bot_id} absent de personas.json : persona de repli", flush=True)
+        # Ni persona en base ni dans personas.json : persona déterministe, la
+        # même à chaque partie. À figer en base avec backend/scripts/add-bot.ts.
+        print(f"⚠️ bot {bot_id} sans persona : persona de repli", flush=True)
         persona = Persona.from_dict(draw_persona(seed_for(bot_id)))
         _PERSONAS[bot_id] = persona
     return persona

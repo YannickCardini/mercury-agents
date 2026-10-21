@@ -25,9 +25,11 @@ la meilleure séquence de cartes sur la main courante.
 1. Le backend appelle `POST /dispatch` avec le body `{"gameMode": "2v2", "avoidUserIds": [...]}`.
    Le moment de chaque appel suit le script d'arrivée de la file, tiré côté backend
    (`backend/src/session/matchmaking-script.ts` de Mercury).
-2. Le service choisit une identité libre, de préférence hors `avoidUserIds` (les bots déjà
-   croisés récemment par les humains de la file ; le userId d'un bot est son botId).
-   Il répond 503 si les 27 identités sont occupées.
+2. Le service choisit une identité libre dans le pool, de préférence hors `avoidUserIds`
+   (les bots déjà croisés récemment par les humains de la file ; le userId d'un bot est son botId).
+   Il répond 503 si toutes les identités sont occupées.
+   - Le pool est relu au plus une fois par minute via `GET /api/auth/bots` (`pool.py`).
+   - Repli : la dernière liste connue, à défaut les ids 1 à 27.
 3. Le bot s'authentifie (`POST /api/auth/bot`), ouvre un WebSocket et rejoint la file comme un humain.
    Si le serveur n'a plus besoin de lui (partie déjà lancée, file annulée), il ferme la
    socket (close 1000) : le bot loggue « renvoyé de la file » et libère son identité.
@@ -42,17 +44,29 @@ la meilleure séquence de cartes sur la main courante.
      - borné par `MERCURY_THINK_MIN` / `MERCURY_THINK_MAX` (0,5 s / 14 s par défaut).
 5. Fin de partie → bot libéré et disponible à nouveau
 
-**Personas** (`persona.py`, `personas.json`) : chaque identité a un caractère fixe, le même
-à chaque partie.
+**Personas** (`persona.py`) : chaque identité a un caractère fixe, le même à chaque partie,
+stocké sur son compte en base (`botPersona`) et transmis par le pool.
 - Bavardage : discret, réservé, normal ou bavard. Il multiplie les probabilités de réaction.
 - Emojis payants « possédés » : aucun, quelques-uns ou beaucoup. Le bot ne pioche que dans
   les gratuits et les siens ; le serveur laisse passer les payants d'un bot.
 - Un éventuel emoji fétiche.
 - Un rythme de jeu.
 
-Les personas sont tirées une seule fois puis commitées. Après l'ajout d'identités au pool, lancer
-`python tools/generate_personas.py <nombre>` : le script ne complète que les botIds absents et ne
-modifie jamais une persona existante.
+`personas.json` garde les personas des 27 premiers bots : c'est la source de leur import en base,
+et le repli tant que le backend n'en fournit pas.
+
+### Ajouter un bot (sans redéploiement)
+
+Depuis `backend/` de Mercury : le script crée le compte (id au format Google, avatar 512×512 sur
+le Blob, persona) et le service le prend en compte dans la minute.
+
+```bash
+npx tsx scripts/add-bot.ts --name "Prénom Nom" --photo chemin/photo.jpg            # dry-run
+npx tsx scripts/add-bot.ts --name "Prénom Nom" --photo chemin/photo.jpg --apply    # écrit
+```
+
+Traits optionnels : `--style silent|quiet|normal|chatty`, `--owned 😎,⏰` (ou `none`),
+`--favorite 😎` (ou `none`), `--pace 0.75..1.35`. Les autres sont tirés pour équilibrer le pool.
 
 ---
 
@@ -88,7 +102,7 @@ Calcule le masque des **501 actions légales** à partir de la main et des posit
 | Fichier                | Rôle                                                                                           |
 |-------------------------|-------------------------------------------------------------------------------------------------|
 | `persona.py`           | Personas figées par identité (emojis possédés, bavardage, rythme), lues dans `personas.json`.  |
-| `tools/generate_personas.py` | Complète `personas.json` pour les nouvelles identités, sans toucher aux existantes.     |
+| `pool.py`              | Pool des identités relu en base (`GET /api/auth/bots`), avec repli sur la dernière liste connue. |
 | `game_state_utils.py`  | Helpers partagés sur le gameState (détection de victoire, billes par couleur, invincibilité).  |
 | `reward.py`             | `marble_progress()` — progrès normalisé d'une bille, utilisé par le scoring du planificateur.  |
 

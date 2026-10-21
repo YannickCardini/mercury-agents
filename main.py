@@ -36,6 +36,7 @@ from mercury_legal_moves import (
 )
 from plan_hand import plan_hand_pick
 from persona import FAVORITE_WEIGHT, persona_for
+from pool import BotPool
 from game_state_utils import (
     detect_winners as _detect_winners,
     marbles_by_color as _marbles_by_color,
@@ -88,8 +89,9 @@ def think_delay(n_legal: int, first_turn: bool, pace: float,
         delay += rng.uniform(*extra)
     return max(THINK_MIN, min(THINK_MAX, delay))
 
-# Identités des bots. Les comptes correspondants existent déjà en base ;
-# le nom est récupéré depuis la réponse de /api/auth/bot.
+# Identités de secours, utilisées tant que le backend n'a pas répondu à
+# GET /api/auth/bots (cf. pool.py) : le vrai pool vit en base, un bot s'y ajoute
+# par backend/scripts/add-bot.ts, sans redéployer ce service.
 BOT_IDENTITIES: list[dict] = [{"botId": str(i)} for i in range(1, 28)]
 
 # Délai minimum entre deux réactions (serveur ignore les envois sous 2 s)
@@ -213,12 +215,14 @@ class InferenceBot:
     """Joue une partie en utilisant le planificateur de main (plan_hand.plan_hand_pick) :
     recherche en faisceau de la meilleure séquence de cartes sur la main courante."""
 
-    def __init__(self, identity: dict, game_mode: str = DEFAULT_GAME_MODE):
+    def __init__(self, identity: dict, game_mode: str = DEFAULT_GAME_MODE,
+                 persona_data: dict | None = None):
         # Hint du dispatch — écrasé par gameState.gameMode (source de vérité) en partie.
         self.game_mode = game_mode
         self.bot_id = identity["botId"]
-        # Habitudes du bot (emojis, bavardage, rythme), les mêmes à chaque partie.
-        self.persona = persona_for(self.bot_id)
+        # Habitudes du bot (emojis, bavardage, rythme), les mêmes à chaque partie :
+        # celles de son compte en base (pool), à défaut celles de personas.json.
+        self.persona = persona_for(self.bot_id, persona_data)
         self._turns_played = 0
         # Vrai dès que le serveur a confirmé le siège (`welcome`) : sinon une
         # fermeture de socket est un renvoi de la file, pas une fin de partie.
@@ -549,9 +553,10 @@ class InferenceBot:
 
 
 async def run_bot_session(identity: dict,
-                          game_mode: str = DEFAULT_GAME_MODE) -> None:
+                          game_mode: str = DEFAULT_GAME_MODE,
+                          persona_data: dict | None = None) -> None:
     """Cycle complet : auth → WS → 1 partie → close. Robuste aux erreurs."""
-    bot = InferenceBot(identity, game_mode=game_mode)
+    bot = InferenceBot(identity, game_mode=game_mode, persona_data=persona_data)
     print(f"connection du bot {bot.bot_id} (mode {game_mode})")
     try:
         async with httpx.AsyncClient() as client:
@@ -576,10 +581,12 @@ def _cleanup_active(active: dict) -> None:
             del active[bid]
 
 
-def _next_free_identity(active: dict, avoid: frozenset[str] = frozenset()) -> dict | None:
+def _next_free_identity(active: dict, avoid: frozenset[str] = frozenset(),
+                        pool_ids: list[str] | None = None) -> dict | None:
     """Identité libre au hasard, de préférence hors `avoid` (bots croisés
     récemment par les humains de la file) ; à défaut, n'importe laquelle."""
-    free = [ident for ident in BOT_IDENTITIES if ident["botId"] not in active]
+    ids = pool_ids if pool_ids is not None else [i["botId"] for i in BOT_IDENTITIES]
+    free = [{"botId": bot_id} for bot_id in ids if bot_id not in active]
     if not free:
         return None
     fresh = [ident for ident in free if ident["botId"] not in avoid]
@@ -607,14 +614,17 @@ async def dispatch_handler(request: web.Request) -> web.Response:
 
     active: dict = request.app["active"]
     _cleanup_active(active)
+    pool: BotPool = request.app["pool"]
+    await pool.refresh()
 
-    ident = _next_free_identity(active, avoid)
+    ident = _next_free_identity(active, avoid, pool.ids())
     if ident is None:
         return web.json_response({"status": "busy", "active": list(active)},
                                  status=503)
 
     active[ident["botId"]] = {
-        "task": asyncio.create_task(run_bot_session(ident, game_mode)),
+        "task": asyncio.create_task(run_bot_session(
+            ident, game_mode, persona_data=pool.persona_data(ident["botId"]))),
         "gameMode": game_mode,
     }
     print(f"[dispatch] bot {ident['botId']} (mode {game_mode})")
@@ -632,18 +642,22 @@ async def health_handler(_: web.Request) -> web.Response:
 async def status_handler(request: web.Request) -> web.Response:
     active: dict = request.app["active"]
     _cleanup_active(active)
+    pool: BotPool = request.app["pool"]
+    await pool.refresh()
     return web.json_response({
         "active":    list(active),
         # Mode de jeu de chaque bot actif (hint du dispatch de sa partie en cours).
         "gameModes": {bid: entry["gameMode"] for bid, entry in active.items()},
-        "available": [i["botId"] for i in BOT_IDENTITIES
-                      if i["botId"] not in active],
+        "available": [bot_id for bot_id in pool.ids() if bot_id not in active],
+        # « backend » : pool relu en base ; « static » : liste de secours (1 à 27).
+        "poolSource": pool.source,
     })
 
 
 def make_app() -> web.Application:
     app = web.Application()
     app["active"] = {}
+    app["pool"] = BotPool(API_URL, BOT_SECRET, [i["botId"] for i in BOT_IDENTITIES])
     app.router.add_post("/dispatch", dispatch_handler)
     app.router.add_get("/health",    health_handler)
     app.router.add_get("/status",    status_handler)
